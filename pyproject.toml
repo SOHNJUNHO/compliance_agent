@@ -1,0 +1,16 @@
+[project]
+name = "compliance-agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "llama-index-core>=0.14.0",
+    "llama-index-embeddings-ollama>=0.8.0",
+    "llama-index-llms-ollama>=0.8.0",
+    "llama-index-vector-stores-qdrant>=0.8.0",
+    "pdfminer-six>=20260107",
+    "qdrant-client>=1.15.0",
+    "requests>=2.33.1",
+]
