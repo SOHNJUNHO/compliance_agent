@@ -40,9 +40,10 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 EMBEDDING_MODEL = OllamaEmbedding(model_name=EMBEDDING_MODEL_NAME)
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_URL        = os.getenv("QDRANT_URL",        "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "compliance_agents")
-USE_QDRANT = os.getenv("USE_QDRANT", "1") != "0"
+QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY",    "")   # required for Qdrant Cloud; empty = local (no auth)
+USE_QDRANT        = os.getenv("USE_QDRANT",        "1") != "0"
 
 # article_lookup.json 저장 경로
 LOOKUP_INDEX_PATH = Path("data/article_lookup.json")
@@ -137,7 +138,10 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
             from qdrant_client import QdrantClient
             from llama_index.vector_stores.qdrant import QdrantVectorStore
 
-            client = QdrantClient(url=QDRANT_URL)
+            client = QdrantClient(
+                url=QDRANT_URL,
+                api_key=QDRANT_API_KEY or None,  # None = unauthenticated (local Docker)
+            )
             vector_store = QdrantVectorStore(
                 client=client,
                 collection_name=QDRANT_COLLECTION,

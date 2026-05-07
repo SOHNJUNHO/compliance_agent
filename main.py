@@ -21,10 +21,16 @@ import asyncio
 import sys
 import logging
 
+from dotenv import load_dotenv
+load_dotenv()  # .env 파일에서 환경변수 로드 (없으면 무시)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s %(name)s: %(message)s"
 )
+
+from langfuse import observe, get_client
+from langfuse.decorators import langfuse_context
 
 # =============================================================================
 # LLM 설정 (교체 지점)
@@ -46,6 +52,7 @@ LLM_INSTANCE = Ollama(
 # query 모드 실행 함수
 # =============================================================================
 
+@observe(name="compliance_query", as_type="span")
 async def run_query(query: str) -> None:
     """컴플라이언스 질문을 워크플로우에 전달하고 결과를 출력한다."""
     sys.path.insert(0, ".")
@@ -57,6 +64,13 @@ async def run_query(query: str) -> None:
     from data.parser import parse_all
     from workflow.tools import tool_registry
     from workflow.compliance_workflow import ComplianceWorkflow
+    from langfuse_setup import sync_prompts
+
+    # Langfuse 루트 트레이스 입력 기록
+    langfuse_context.update_current_observation(input={"query": query})
+
+    # Langfuse 프롬프트 동기화 (없으면 로컬 파일에서 업로드)
+    sync_prompts()
 
     print("데이터 준비 중... (처음 실행 시 시간이 걸립니다)")
 
@@ -88,8 +102,25 @@ async def run_query(query: str) -> None:
         print(f"[팩트체크] {'통과 ✓' if result.factcheck_passed else '실패 ✗'}")
         print(f"[실행 에이전트] {result.agents_used}")
         print(f"[총 토큰 사용량] {result.token_used}")
+
+        # Langfuse 루트 트레이스 출력 기록
+        langfuse_context.update_current_observation(
+            output={
+                "verdict": result.verdict,
+                "factcheck_passed": result.factcheck_passed,
+                "risk_level": result.risk_level,
+            },
+            metadata={
+                "agents_used": result.agents_used,
+                "token_used": result.token_used,
+            },
+        )
     else:
         print(f"결과: {result}")
+
+    # 프로세스 종료 전 Langfuse 이벤트 큐를 강제 전송
+    # 스크립트/CLI 환경에서는 백그라운드 스레드가 종료 전에 flush를 보장하지 않으므로 필수
+    get_client().flush()
 
 
 # =============================================================================
