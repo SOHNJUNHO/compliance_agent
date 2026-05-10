@@ -18,6 +18,7 @@
 #   - REQUEST_DELAY로 서버 부하를 방지한다
 # =============================================================================
 
+import os
 import time          # REQUEST_DELAY 구현에 사용
 import logging       # 수집 과정 로그 출력
 import unicodedata
@@ -120,10 +121,13 @@ def scrape_kofia() -> list[RawDocument]:
 # =============================================================================
 
 # 법제처 DRF Open API 설정
-# OC: 신청한 사용자 인증키 (law.go.kr 공공데이터 포털에서 발급)
+# OC: 신청한 사용자 인증키 (open.law.go.kr → 마이페이지 → OC 발급)
+#     서버 IP 등록 필요. 미등록/미설정 시 응답 XML에
+#     "사용자 정보 검증에 실패하였습니다."가 포함된다.
+#     .env의 DRF_OC로 주입한다 — 캐시된 data/raw/만 사용하는 일반 실행에는 필요 없다.
 # MST: 법령일련번호 (lawSearch로 조회하여 확인)
 DRF_BASE = "https://www.law.go.kr/DRF/lawService.do"
-DRF_OC = "gamster2"
+DRF_OC = os.getenv("DRF_OC", "")
 
 LAWGOKR_TARGETS = [
     {

@@ -174,6 +174,7 @@ prompts/
 
 ## 한계 및 TODO
 
+- **LLM 호출 장애 처리는 최소 수준**: 현재는 `BudgetExceeded`(토큰 초과)만 잡습니다. Ollama 연결 끊김·타임아웃 등 실시간 LLM 장애 시 synthesize/factcheck step은 그대로 예외를 던지며 워크플로우를 중단합니다. 운영 환경에서는 retry / circuit breaker / degraded fallback 응답 / per-step deadline 등의 정교화가 필요합니다.
 - **Ollama 직렬 처리**: Step 2a/b/c는 비동기 병렬 설계이지만 Ollama가 요청을 순차 처리하므로 실제 wall-clock 병렬화는 안 됩니다. 동시 추론이 가능한 모델 서버로 LLM을 교체해야 합니다.
 - **토큰 카운트는 추정값**: `circuit_breaker.py`의 `estimated_tokens`는 상수이며 실제 사용량과 다릅니다. 정확한 값은 LLM 응답의 `usage` 필드를 파싱해야 합니다. HyDE 호출은 budget에 포함되지 않습니다.
 - **PDF 파서는 best-effort**: 금감원 분쟁사례 PDF의 사례 경계 regex는 표준 형식 가정에 의존합니다. 다른 PDF는 별도 검증이 필요합니다.

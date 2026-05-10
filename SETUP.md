@@ -182,3 +182,4 @@ python main.py ingest ./분쟁사례.pdf
 | `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
 | `TOKEN_BUDGET` | `32000` | Max total tokens per workflow run |
 | `STEP_TOKEN_LIMIT` | `4000` | Max tokens per individual step |
+| `DRF_OC` | *(empty)* | law.go.kr open-API key — only needed to re-scrape `법규`/판례 (cached `data/raw/` covers normal runs) |
