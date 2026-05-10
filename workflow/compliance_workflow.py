@@ -98,20 +98,11 @@ def load_prompt(name: str) -> str:
 
 
 # =============================================================================
-# Step 1 분류 규칙 (Rule-based)
+# Step 1 분류: LLM 기반 에이전트 라우팅
 # =============================================================================
-
-# 키워드 → 에이전트 매핑 딕셔너리
-# 질문에 이 키워드가 포함되면 해당 에이전트를 활성화한다
-# 여러 에이전트가 동시에 활성화될 수 있음 (AND가 아닌 OR 조건)
-CLASSIFY_RULES: dict[str, list[str]] = {
-    # 사규 에이전트: 투자 행위와 관련된 키워드
-    "규정": ["적합성", "투자권유", "설명의무", "권유", "고령", "파생", "ELS", "내부통제", "준법"],
-    # 법규 에이전트: 법률/제도/처벌과 관련된 키워드
-    "법규": ["법률", "조항", "자본시장법", "금융투자업", "위반", "제재", "과태료"],
-    # 사례 에이전트: 사례/분쟁과 관련된 키워드
-    "사례": ["사례", "분쟁", "판례", "피해", "손실보상", "조정"],
-}
+# classify_agent.txt 프롬프트로 LLM이 어떤 검색 레인을 열지 결정한다.
+# 출력은 {"규정", "법규", "사례"} 집합으로 제한되며, 허용되지 않은 값은 코드에서 제거된다.
+# LLM 출력이 파싱 불가하거나 빈 리스트이면 3개 레인을 모두 여는 fallback이 동작한다.
 
 
 # =============================================================================
@@ -156,18 +147,24 @@ class ComplianceWorkflow(Workflow):
         ev: StartEvent  # LlamaIndex가 자동으로 이 Step을 시작점으로 인식
     ) -> ClassifiedEvent:
         """
-        사용자 질문을 키워드로 분류해 필요한 에이전트 목록을 결정한다.
+        LLM이 질문을 분석해 활성화할 검색 에이전트 목록을 결정한다.
 
-        LLM을 사용하지 않는 이유:
-          라우팅 결정이 LLM에 맡겨지면 같은 질문에 다른 에이전트가 선택될 수 있다.
-          워크플로우 진입점은 결정론적이어야 한다.
+        LLM 사용 이유:
+          하드코딩된 키워드는 동의어, 신조어, 우회 표현을 처리할 수 없어 확장성이 없다.
+          LLM은 의미 기반으로 레인을 선택하며, 출력은 {"규정","법규","사례"} 집합으로 제한된다.
+
+        안전 경계:
+          LLM은 레인 활성화(넓고 복구 가능한 결정)만 담당한다.
+          source_name·citation_id 정밀 필터는 _precision_filters()에서 regex로만 처리한다.
+          → LLM의 잘못된 추론이 하드 AND 필터로 전파될 수 없다.
+
+        fallback:
+          LLM 출력이 파싱 불가하거나 유효한 에이전트가 없으면 3개 레인 전체를 활성화한다.
 
         ctx 초기화:
           모든 Step이 공유하는 ctx에 초기값을 설정한다.
           이 Step이 항상 첫 번째로 실행되므로 초기화 위치로 적합하다.
         """
-        # ev.get(): StartEvent의 kwargs에서 값을 가져옴
-        # wf.run(query="질문") 으로 전달된 값
         query: str = ev.get("query", "")
 
         # Langfuse: Step 입력 기록
@@ -178,24 +175,31 @@ class ComplianceWorkflow(Workflow):
         await ctx.set("retry_count", 0)    # factcheck 재시도 카운터
         await ctx.set("agents_used", [])   # 실제 실행된 에이전트 기록
 
-        # CLASSIFY_RULES의 키워드와 질문을 비교해 에이전트 목록 결정
-        agent_list = []
-        for agent_name, keywords in CLASSIFY_RULES.items():
-            # 키워드 중 하나라도 질문에 포함되면 해당 에이전트 활성화
-            if any(kw in query for kw in keywords):
-                agent_list.append(agent_name)
+        # ── LLM 라우팅 ────────────────────────────────────────────────────────
+        prompt = load_prompt("classify_agent")
+        response = await self.llm.acomplete(f"{prompt}\n\n질문: {query}")
+        parsed = self._safe_json(response.text)
 
-        # 아무 키워드도 매칭되지 않으면 안전을 위해 전체 활성화
+        # LLM 출력에서 허용된 값만 통과 (hallucination 차단)
+        raw_agents = parsed.get("agents", [])
+        agent_list = [a for a in raw_agents if a in {"규정", "법규", "사례"}]
+        routing_reasoning = parsed.get("reasoning", "")
+
+        # ── 안전 fallback ────────────────────────────────────────────────────
+        # LLM이 유효한 에이전트를 하나도 반환하지 못한 경우 전체 레인을 열어
+        # 관련 근거를 누락하는 것보다 불필요한 검색이 낫다는 원칙을 적용한다.
         if not agent_list:
             agent_list = ["규정", "법규", "사례"]
-            logger.info("[classify] 키워드 미매칭 → 전체 에이전트 활성화")
+            routing_reasoning += " [fallback: 전체 활성화]"
+            logger.warning("[classify] LLM 출력 파싱 실패 → 전체 에이전트 활성화")
 
-        logger.info(f"[classify] 활성화 에이전트: {agent_list}")
+        logger.info(f"[classify] 활성화 에이전트: {agent_list} | 근거: {routing_reasoning}")
 
-        # Langfuse: Step 출력 기록
-        langfuse_context.update_current_observation(output={"agent_list": agent_list})
+        # Langfuse: routing_reasoning을 출력으로 기록 → 대시보드에서 LLM 판단 근거 확인 가능
+        langfuse_context.update_current_observation(
+            output={"agent_list": agent_list, "routing_reasoning": routing_reasoning}
+        )
 
-        # ClassifiedEvent 반환 → LlamaIndex가 search_* Step들을 트리거
         return ClassifiedEvent(query=query, agent_list=agent_list)
 
     # =========================================================================
@@ -236,11 +240,18 @@ class ComplianceWorkflow(Workflow):
         # → 법규나 분쟁사례가 섞일 수 없음
         try:
             precision_filters = self._precision_filters(ev.query, "규정")
+            # HyDE: 원본 쿼리를 가상 법령 조항으로 변환해 벡터 공간 정렬 개선
+            # precision_filters는 원본 쿼리 기준으로 추출 (명시된 조항번호·문서명 regex)
+            hyde_query = await self._hyde_transform(ev.query)
             langfuse_context.update_current_observation(
-                input={"query": ev.query, "precision_filters": precision_filters},
+                input={
+                    "query": ev.query,
+                    "hyde_query": hyde_query,
+                    "precision_filters": precision_filters,
+                },
             )
             raw_results: list[dict] = self.registry.regulation_search(
-                query=ev.query,
+                query=hyde_query,   # 임베딩에는 가상 조항 사용
                 **precision_filters,
             )
             logger.info(f"[search_규정] 검색 완료: {len(raw_results)}개 결과")
@@ -302,10 +313,15 @@ class ComplianceWorkflow(Workflow):
         # law_search 호출 (source_type="법규" 고정)
         try:
             precision_filters = self._precision_filters(ev.query, "법규")
+            hyde_query = await self._hyde_transform(ev.query)
             langfuse_context.update_current_observation(
-                input={"query": ev.query, "precision_filters": precision_filters},
+                input={
+                    "query": ev.query,
+                    "hyde_query": hyde_query,
+                    "precision_filters": precision_filters,
+                },
             )
-            raw_results = self.registry.law_search(query=ev.query, **precision_filters)
+            raw_results = self.registry.law_search(query=hyde_query, **precision_filters)
         except Exception as e:
             logger.warning(f"[search_법규] 검색 실패: {e}")
             langfuse_context.update_current_observation(
@@ -363,10 +379,15 @@ class ComplianceWorkflow(Workflow):
         # case_search 호출 (source_type="분쟁사례" 고정)
         try:
             precision_filters = self._precision_filters(ev.query, "사례")
+            hyde_query = await self._hyde_transform(ev.query)
             langfuse_context.update_current_observation(
-                input={"query": ev.query, "precision_filters": precision_filters},
+                input={
+                    "query": ev.query,
+                    "hyde_query": hyde_query,
+                    "precision_filters": precision_filters,
+                },
             )
-            raw_results = self.registry.case_search(query=ev.query, **precision_filters)
+            raw_results = self.registry.case_search(query=hyde_query, **precision_filters)
         except Exception as e:
             logger.warning(f"[search_사례] 검색 실패: {e}")
             langfuse_context.update_current_observation(
@@ -698,6 +719,37 @@ class ComplianceWorkflow(Workflow):
     # =========================================================================
     # 헬퍼 메서드: 포맷터 / 파서
     # =========================================================================
+
+    async def _hyde_transform(self, query: str) -> str:
+        """
+        HyDE (Hypothetical Document Embedding): 원본 질문을 가상 법령 조항으로 변환한다.
+
+        왜 필요한가:
+          질문("65세 고객에게 레버리지 ETF 권유 가능한가요?")과 코퍼스("금융투자업자는
+          고령투자자에 대해 강화된 적합성 확인 절차를 적용하여야 한다")는 언어 형식과
+          어휘가 달라 임베딩 벡터 공간에서 멀리 위치할 수 있다.
+          LLM이 코퍼스와 같은 법령 문체로 가상 조항을 생성하면 임베딩 공간에서
+          실제 조항과 가까워져 검색 정밀도가 높아진다.
+
+        안전성:
+          가상 조항은 임베딩에만 사용되고 최종 답변에는 노출되지 않는다.
+          조항 번호 인용을 금지하므로 잘못된 citation이 생성되지 않는다.
+          실패 시 원본 쿼리를 반환하므로 워크플로우가 중단되지 않는다.
+
+        Reference: Gao et al. (2022) "Precise Zero-Shot Dense Retrieval without
+                   Relevance Labels", arXiv:2212.10496
+        """
+        try:
+            prompt = load_prompt("hyde_agent").replace("{query}", query)
+            response = await self.llm.acomplete(prompt)
+            hypothesis = response.text.strip()
+            if len(hypothesis) >= 20:
+                logger.info(f"[hyde] 가상 조항 생성 완료: {hypothesis[:80]}...")
+                return hypothesis
+            logger.warning("[hyde] 생성된 가상 조항이 너무 짧음 → 원본 쿼리 사용")
+        except Exception as e:
+            logger.warning(f"[hyde] 생성 실패, 원본 쿼리 사용: {e}")
+        return query
 
     def _precision_filters(self, query: str, agent: str) -> dict:
         """

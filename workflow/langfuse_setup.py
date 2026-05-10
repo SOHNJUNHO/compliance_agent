@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 PROMPT_DIR = Path("prompts")
 
 # Langfuse에 등록/조회할 프롬프트 이름 목록
-PROMPT_NAMES = ["synthesize_agent", "factcheck_agent"]
+PROMPT_NAMES = ["synthesize_agent", "factcheck_agent", "classify_agent", "hyde_agent"]
 
 # 싱글턴 클라이언트 캐시
 _client = None

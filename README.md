@@ -10,10 +10,10 @@
 
 ```
 StartEvent(query)
-  → [Step 1] classify_step       키워드 매칭으로 활성화할 에이전트 결정 (LLM 미사용)
-  → [Step 2a] search_규정        사규 벡터 검색 → citation_id exact-match 검증
-  → [Step 2b] search_법규        법규 벡터 검색 → citation_id exact-match 검증       ← 병렬 실행
-  → [Step 2c] search_사례        분쟁사례 벡터 검색 → 사건번호 metadata 검증
+  → [Step 1] classify_step       LLM 라우팅 (constrained JSON) → 활성화 레인 결정
+  → [Step 2a] search_규정        HyDE 변환 → 사규 벡터 검색 → citation_id exact-match 검증
+  → [Step 2b] search_법규        HyDE 변환 → 법규 벡터 검색 → citation_id exact-match 검증  ← 병렬
+  → [Step 2c] search_사례        HyDE 변환 → 분쟝사례 벡터 검색 → 사건번호 metadata 검증
   → [Step 3]  synthesize_step    검증된 근거만 종합 → 판정 JSON 생성
   → [Step 4]  factcheck_step     최종 인용 citation_id 존재 여부 exact-match 재검증
   → StopEvent(result=FinalAnswer)
@@ -22,19 +22,20 @@ StartEvent(query)
 검색 Step은 LLM 요약을 만들지 않고 검증된 근거 객체를 반환합니다.
 최종 LLM은 중간 요약이 아니라 검증된 원문 snippet과 metadata만 보고 판정합니다.
 
-LLM이 도구를 선택하지 않습니다. 금융 컴플라이언스 도메인에서 LLM의 자율 도구 선택은 안전하지 않기 때문입니다.
+LLM이 어떤 검색 함수를 호출할지는 코드가 결정합니다. LLM은 레인 활성화(규정/법규/사례)만 결정하며,
+source_name·citation_id 필터는 코드(regex)가 생성합니다. 금융 컴플라이언스 도메인에서 LLM이 하드 필터를 생성하면 잘못된 추론이 무음 zero-recall로 이어질 수 있기 때문입니다.
 
 ### 에이전트 활성화 규칙
 
-`workflow/compliance_workflow.py`의 `CLASSIFY_RULES`가 키워드 기반으로 검색 에이전트를 활성화합니다.
+`classify_step`이 `classify_agent.txt` 프롬프트를 사용해 LLM에게 라우팅을 위임합니다. LLM은 질문의 의미를 분석해 `["규정", "법규", "사례"]` 중 활성화할 레인을 JSON으로 반환하며, 근거(`reasoning`)도 함께 출력합니다.
 
-| 에이전트 | 트리거 예시 |
+| 에이전트 | 커버 범위 |
 |---|---|
-| 규정 | 적합성, 투자권유, 설명의무, 권유, 고령, 파생, ELS, 내부통제, 준법 |
-| 법규 | 법률, 조항, 자본시장법, 금융투자업, 위반, 제재, 과태료 |
-| 사례 | 사례, 분쟁, 판례, 피해, 손실보상, 조정 |
+| 규정 | 투자권유, 적합성원칙, 설명의무, 고령·장애인 투자자 보호, 파생상품 권유 제한, 준법감시, 내부통제 |
+| 법규 | 법적 의무와 금지행위, 인허가, 과태료·형사처벌, 불공정거래, 공시 의무 |
+| 사례 | 실제 소송/분쟝 결과, 손해배상 판결, 법원의 의무 해석 기준 |
 
-키워드가 하나도 매칭되지 않으면 데모 안전성을 위해 세 에이전트를 모두 실행합니다.
+LLM이 유효한 에이전트를 반환하지 못하면 세 레인을 모두 활성화하는 fallback이 동작합니다. Langfuse 트레이스의 `classify_step` 스팬에서 LLM의 라우팅 근거를 확인할 수 있습니다.
 
 ---
 
@@ -178,7 +179,10 @@ prompts/
 
 - **LLM**: Ollama `qwen2.5:7b`
 - **Embedding**: Ollama `qwen3-embedding:0.6b` (`EMBEDDING_MODEL` 환경변수로 교체 가능)
-- **Vector DB**: Qdrant (`QDRANT_URL`, `QDRANT_COLLECTION` 환경변수로 설정)
+- **Reranker**: `Qwen/Qwen3-Reranker-0.6B` cross-encoder (`USE_RERANKER=0`으로 비활성화 가능)
+- **Query transform**: HyDE — 질문을 가상 법령 조항으로 변환 후 임베딩 (Gao et al. 2022)
+- **Routing**: `classify_agent.txt` — LLM이 의미 기반으로 레인 활성화 결정 (constrained JSON)
+- **Vector DB**: Qdrant Cloud (`QDRANT_URL`, `QDRANT_API_KEY` 환경변수로 설정)
 - **Fallback**: Qdrant 초기화 실패 시 인메모리 VectorStore
 - **Factcheck**: `article_lookup.json` exact-match dictionary
 
