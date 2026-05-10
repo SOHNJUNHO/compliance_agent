@@ -47,16 +47,19 @@ LookupFn = Callable[[str, str], Optional[dict]]
 
 def _make_search_fn(
     index: VectorStoreIndex,
-    source_type: str,    # 이 값이 하드코딩되어 필터로 사용됨
-    top_k: int = 3,      # 반환할 최대 결과 수
+    source_type: str,         # 이 값이 하드코딩되어 필터로 사용됨
+    top_k: int = 3,           # 초기 벡터 검색 후보 수 (재순위 시 더 크게 설정됨)
+    reranker=None,            # ComplianceReranker 인스턴스 (없으면 None)
+    final_top_n: int = None,  # 재순위 후 최종 반환 수 (None이면 top_k 그대로)
 ) -> SearchFn:
     """
     source_type 필터가 고정된 벡터 검색 함수를 생성한다.
 
-    내부 동작:
-      1. index.as_retriever()로 Retriever 생성
-         MetadataFilters로 source_type을 고정 필터로 설정
-      2. Retriever를 호출하는 search_fn 함수 정의
+    재순위(reranker) 유무에 따른 동작:
+      reranker=None : 벡터 유사도 상위 top_k개 바로 반환 (기존 동작)
+      reranker 있음 : 벡터 유사도 상위 top_k개를 먼저 가져온 뒤
+                     cross-encoder로 재순위하여 상위 final_top_n개만 반환.
+                     → 정밀도 향상: (쿼리, 청크) 쌍을 함께 보고 관련성 직접 예측
 
     반환 형식 (list[dict]):
       [
@@ -67,7 +70,7 @@ def _make_search_fn(
           "case_no":     "",
           "category":    "적합성원칙",
           "url":         "https://...",
-          "score":       0.87          ← 코사인 유사도 점수
+          "score":       0.87          ← 코사인 유사도 점수 (재순위 후에도 원본 유지)
         },
         ...
       ]
@@ -122,6 +125,14 @@ def _make_search_fn(
 
         # retriever.retrieve(): 쿼리를 임베딩하고 저장된 벡터와 유사도 비교
         nodes = retriever.retrieve(query)
+
+        # ── 재순위 (reranker가 있을 때만 실행) ──────────────────────────────
+        # cross-encoder가 (query, chunk) 쌍을 함께 보고 관련성 재평가 → 정밀도 향상
+        if reranker is not None and nodes:
+            nodes = reranker.postprocess_nodes(nodes, query_str=query)
+            # reranker.top_n=10으로 설정되어 있으므로 여기서 최종 개수로 절삭
+            cutoff = final_top_n if final_top_n is not None else top_k
+            nodes = nodes[:cutoff]
 
         results = []
         for node in nodes:
@@ -225,34 +236,53 @@ class ToolRegistry:
         self.case_search:       Optional[SearchFn] = None
         self.article_lookup:    Optional[LookupFn] = None
 
-    def build(self, index: VectorStoreIndex) -> None:
+    def build(self, index: VectorStoreIndex, reranker=None) -> None:
         """
         VectorStoreIndex를 받아 4개 함수를 초기화한다.
         main.py에서 ingest() 후 이 메서드를 호출한다.
+
+        Args:
+            index:    VectorStoreIndex (Qdrant 또는 인메모리)
+            reranker: ComplianceReranker 인스턴스 (없으면 None → 재순위 생략)
+                      reranker가 있으면 초기 top_k를 크게 잡아 더 많은 후보를 수집하고,
+                      cross-encoder로 재순위한 뒤 최종 개수(3/2)로 절삭한다.
         """
+        # reranker 유무에 따라 초기 후보 수 결정
+        # 재순위 시: 더 많은 후보(10/5)에서 cross-encoder가 최적 결과 선택
+        # 재순위 없음: 기존 top_k(3/2) 그대로 사용
+        initial_reg_law_k = 10 if reranker else 3
+        initial_case_k    = 5  if reranker else 2
+
         # 사규 검색 함수: source_type="사규" 고정 필터
         self.regulation_search = _make_search_fn(
             index=index,
             source_type="사규",
-            top_k=3,
+            top_k=initial_reg_law_k,
+            reranker=reranker,
+            final_top_n=3,
         )
         # 법규 검색 함수: source_type="법규" 고정 필터
         self.law_search = _make_search_fn(
             index=index,
             source_type="법규",
-            top_k=3,
+            top_k=initial_reg_law_k,
+            reranker=reranker,
+            final_top_n=3,
         )
-        # 분쟁사례 검색 함수: source_type="분쟁사례" 고정 필터
-        # top_k=2: 사례는 본문이 길어서 컨텍스트 절약을 위해 2개만 반환
+        # 분쟁사례 검색 함수: source_type="분쟝사례" 고정 필터
+        # 사례는 본문이 길어 컨텍스트 절약을 위해 최종 2개 반환
         self.case_search = _make_search_fn(
             index=index,
             source_type="분쟁사례",
-            top_k=2,
+            top_k=initial_case_k,
+            reranker=reranker,
+            final_top_n=2,
         )
         # exact match 조회 함수: 벡터 인덱스 불필요 (JSON 파일 기반)
         self.article_lookup = _make_lookup_fn()
 
-        logger.info("ToolRegistry 초기화 완료 (검색/조회 함수 4개)")
+        mode = "재순위 활성화" if reranker else "벡터 검색만"
+        logger.info(f"ToolRegistry 초기화 완료 (검색/조회 함수 4개, {mode})")
 
 
 # 싱글턴 인스턴스

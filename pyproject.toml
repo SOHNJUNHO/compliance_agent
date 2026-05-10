@@ -8,6 +8,7 @@ dependencies = [
     "beautifulsoup4>=4.14.3",
     "langfuse>=4.5.0",
     "llama-index-core>=0.14.0",
+    "llama-index-postprocessor-sentence-transformer-rerank>=0.3.0",
     "llama-index-embeddings-ollama>=0.8.0",
     "llama-index-llms-ollama>=0.8.0",
     "llama-index-vector-stores-qdrant>=0.8.0",

@@ -64,6 +64,7 @@ async def run_query(query: str) -> None:
     from data.parser import parse_all
     from workflow.tools import tool_registry
     from workflow.compliance_workflow import ComplianceWorkflow
+    from workflow.reranker import build_reranker
     from langfuse_setup import sync_prompts
 
     # Langfuse 루트 트레이스 입력 기록
@@ -78,7 +79,9 @@ async def run_query(query: str) -> None:
     chunks = parse_all(raw_docs)
     index = ingest(chunks)
 
-    tool_registry.build(index)
+    # 재순위기 초기화 (USE_RERANKER=0 이면 None → 기존 동작 유지)
+    reranker = build_reranker()
+    tool_registry.build(index, reranker=reranker)
 
     wf = ComplianceWorkflow(
         llm=LLM_INSTANCE,
