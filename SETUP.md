@@ -177,7 +177,7 @@ python main.py ingest ./분쟁사례.pdf
 | `QDRANT_API_KEY` | *(empty)* | Qdrant Cloud API key (empty = local, no auth) |
 | `LANGFUSE_PUBLIC_KEY` | *(none)* | Langfuse public key |
 | `LANGFUSE_SECRET_KEY` | *(none)* | Langfuse secret key |
-| `LANGFUSE_HOST` | `https://cloud.langfuse.com` | Langfuse server URL |
+| `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse server URL (use `https://us.cloud.langfuse.com` for US region) |
 | `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
 | `TOKEN_BUDGET` | `32000` | Max total tokens per workflow run |
 | `STEP_TOKEN_LIMIT` | `4000` | Max tokens per individual step |
