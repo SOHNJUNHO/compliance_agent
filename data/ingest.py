@@ -47,6 +47,9 @@ QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY",    "")   # required for Qdrant C
 USE_QDRANT        = os.getenv("USE_QDRANT",        "1") != "0"
 QDRANT_VECTOR_DIM = int(os.getenv("QDRANT_VECTOR_DIM", "1024"))  # qwen3-embedding:0.6b output dim
 
+# Fields used in MetadataFilter — Qdrant Cloud requires a payload index on each
+PAYLOAD_INDEX_FIELDS = ["source_type", "source_name", "citation_id", "article_no", "case_no", "category"]
+
 # article_lookup.json 저장 경로
 LOOKUP_INDEX_PATH = Path("data/article_lookup.json")
 
@@ -170,6 +173,8 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
             else:
                 logger.info(f"[qdrant] 기존 컬렉션 사용: {QDRANT_COLLECTION}")
 
+            _ensure_payload_indexes(client, QDRANT_COLLECTION, qdrant_models)
+
             vector_store = QdrantVectorStore(
                 client=client,
                 collection_name=QDRANT_COLLECTION,
@@ -247,6 +252,63 @@ def build_lookup_index(chunks: list[ParsedChunk]) -> None:
 # =============================================================================
 # 전체 적재 파이프라인 진입점
 # =============================================================================
+
+def _ensure_payload_indexes(client, collection_name: str, qdrant_models) -> None:
+    """
+    MetadataFilter에 사용되는 모든 필드에 Qdrant 페이로드 인덱스를 생성한다.
+
+    Qdrant Cloud는 필터 대상 필드에 인덱스가 없으면 HTTP 400을 반환한다.
+    이미 존재하는 인덱스는 건너뛰므로 반복 호출해도 안전하다.
+    """
+    info = client.get_collection(collection_name)
+    existing = set(info.payload_schema.keys()) if info.payload_schema else set()
+    for field in PAYLOAD_INDEX_FIELDS:
+        if field not in existing:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+            )
+            logger.info(f"[qdrant] 페이로드 인덱스 생성: {field}")
+
+
+def load_index() -> VectorStoreIndex:
+    """
+    기존 Qdrant 컬렉션에서 VectorStoreIndex를 로드한다. 재임베딩 없음.
+
+    query 모드 전용. python main.py ingest를 먼저 실행해야 한다.
+    LlamaIndex가 쿼리 텍스트만 임베딩하고, 저장된 벡터는 그대로 사용한다.
+    """
+    if not USE_QDRANT:
+        raise RuntimeError(
+            "USE_QDRANT=0: query 모드는 Qdrant가 필요합니다. "
+            "먼저 python main.py ingest를 실행하거나 USE_QDRANT=1로 설정하세요."
+        )
+
+    from qdrant_client import QdrantClient
+    from llama_index.vector_stores.qdrant import QdrantVectorStore
+
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+
+    if not client.collection_exists(QDRANT_COLLECTION):
+        raise RuntimeError(
+            f"Qdrant 컬렉션 '{QDRANT_COLLECTION}'이 없습니다. "
+            "python main.py ingest를 먼저 실행하세요."
+        )
+
+    count = client.count(QDRANT_COLLECTION).count
+    if count == 0:
+        raise RuntimeError(
+            f"Qdrant 컬렉션 '{QDRANT_COLLECTION}'이 비어 있습니다. "
+            "python main.py ingest를 실행하세요."
+        )
+
+    logger.info(f"[qdrant] 기존 컬렉션 로드: {QDRANT_COLLECTION} ({count}개 벡터)")
+    vector_store = QdrantVectorStore(client=client, collection_name=QDRANT_COLLECTION)
+    index = VectorStoreIndex.from_vector_store(vector_store, embed_model=EMBEDDING_MODEL)
+    logger.info("[qdrant] VectorStoreIndex 로드 완료 (재임베딩 없음)")
+    return index
+
 
 def ingest(chunks: list[ParsedChunk]) -> VectorStoreIndex:
     """

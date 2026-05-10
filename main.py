@@ -60,9 +60,8 @@ async def run_query(query: str) -> None:
     sys.path.insert(0, "data")
     sys.path.insert(0, "workflow")
 
-    from data.ingest import ingest
-    from data.scraper import scrape_all
-    from data.parser import parse_all
+    from pathlib import Path
+    from data.ingest import load_index
     from workflow.tools import tool_registry
     from workflow.compliance_workflow import ComplianceWorkflow
     from workflow.reranker import build_reranker
@@ -74,11 +73,11 @@ async def run_query(query: str) -> None:
     # Langfuse 프롬프트 동기화 (없으면 로컬 파일에서 업로드)
     sync_prompts()
 
-    print("데이터 준비 중... (처음 실행 시 시간이 걸립니다)")
+    if not Path("data/article_lookup.json").exists():
+        print("오류: data/article_lookup.json 없음. python main.py ingest를 먼저 실행하세요.")
+        sys.exit(1)
 
-    raw_docs = scrape_all()
-    chunks = parse_all(raw_docs)
-    index = ingest(chunks)
+    index = load_index()
 
     # 재순위기 초기화 (USE_RERANKER=0 이면 None → 기존 동작 유지)
     reranker = build_reranker()
@@ -87,7 +86,7 @@ async def run_query(query: str) -> None:
     wf = ComplianceWorkflow(
         llm=LLM_INSTANCE,
         registry=tool_registry,
-        timeout=120,
+        timeout=300,
         verbose=True,
     )
 
@@ -115,8 +114,8 @@ async def run_query(query: str) -> None:
                 "risk_level": result.risk_level,
             },
             metadata={
-                "agents_used": result.agents_used,
-                "token_used": result.token_used,
+                "agents_used": str(result.agents_used),
+                "token_used": str(result.token_used),
             },
         )
     else:
