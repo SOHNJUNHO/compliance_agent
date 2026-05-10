@@ -38,8 +38,8 @@ ollama serve          # run in a separate terminal and keep it open
 Then pull the models (one-time, ~5 GB total):
 
 ```bash
-ollama pull qwen3:8b                 # LLM (~5.2 GB)
-ollama pull qwen3-embedding:0.6b     # embedding model (~0.4 GB)
+ollama pull qwen3:8b-q4_K_M          # LLM, 4-bit quantized (~5.2 GB)
+ollama pull qwen3-embedding:0.6b-q8_0  # embedding model, 8-bit quantized (~0.6 GB)
 ```
 
 ---
@@ -179,5 +179,6 @@ python main.py ingest ./분쟁사례.pdf
 | `LANGFUSE_SECRET_KEY` | *(none)* | Langfuse secret key |
 | `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse server URL (use `https://us.cloud.langfuse.com` for US region) |
 | `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
+| `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
 | `TOKEN_BUDGET` | `32000` | Max total tokens per workflow run |
 | `STEP_TOKEN_LIMIT` | `4000` | Max tokens per individual step |

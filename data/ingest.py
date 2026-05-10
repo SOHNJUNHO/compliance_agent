@@ -44,6 +44,7 @@ QDRANT_URL        = os.getenv("QDRANT_URL",        "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "compliance_agents")
 QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY",    "")   # required for Qdrant Cloud; empty = local (no auth)
 USE_QDRANT        = os.getenv("USE_QDRANT",        "1") != "0"
+QDRANT_VECTOR_DIM = int(os.getenv("QDRANT_VECTOR_DIM", "1024"))  # qwen3-embedding:0.6b output dim
 
 # article_lookup.json 저장 경로
 LOOKUP_INDEX_PATH = Path("data/article_lookup.json")
@@ -136,17 +137,42 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
     if USE_QDRANT:
         try:
             from qdrant_client import QdrantClient
+            from qdrant_client import models as qdrant_models
             from llama_index.vector_stores.qdrant import QdrantVectorStore
 
             client = QdrantClient(
                 url=QDRANT_URL,
                 api_key=QDRANT_API_KEY or None,  # None = unauthenticated (local Docker)
             )
+            logger.info(f"Qdrant 사용: {QDRANT_URL} / collection={QDRANT_COLLECTION}")
+
+            # Pre-create collection with INT8 scalar quantization if it does not exist.
+            # LlamaIndex respects a pre-created collection and will not overwrite it.
+            # To apply quantization to an existing collection, delete it in the Qdrant
+            # console first, then re-run ingest.
+            if not client.collection_exists(QDRANT_COLLECTION):
+                client.create_collection(
+                    collection_name=QDRANT_COLLECTION,
+                    vectors_config=qdrant_models.VectorParams(
+                        size=QDRANT_VECTOR_DIM,
+                        distance=qdrant_models.Distance.COSINE,
+                    ),
+                    quantization_config=qdrant_models.ScalarQuantization(
+                        scalar=qdrant_models.ScalarQuantizationConfig(
+                            type=qdrant_models.ScalarType.INT8,
+                            quantile=0.99,
+                            always_ram=True,
+                        ),
+                    ),
+                )
+                logger.info(f"[qdrant] 컬렉션 생성 완료 (INT8 스칼라 양자화): {QDRANT_COLLECTION}")
+            else:
+                logger.info(f"[qdrant] 기존 컬렉션 사용: {QDRANT_COLLECTION}")
+
             vector_store = QdrantVectorStore(
                 client=client,
                 collection_name=QDRANT_COLLECTION,
             )
-            logger.info(f"Qdrant 사용: {QDRANT_URL} / collection={QDRANT_COLLECTION}")
         except Exception as e:
             logger.warning(f"Qdrant 초기화 실패, 인메모리 VectorStore 사용: {e}")
 
