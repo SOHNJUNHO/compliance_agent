@@ -31,7 +31,6 @@
 
 import logging
 import re
-from pathlib import Path
 from typing import Optional
 
 from langfuse import observe, get_client
@@ -67,9 +66,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # 프롬프트 파일 로더
 # =============================================================================
-
-# 프롬프트 파일 디렉토리
-PROMPT_DIR = Path("prompts")
 
 
 def load_prompt(name: str) -> str:
@@ -589,14 +585,15 @@ class ComplianceWorkflow(Workflow):
         lookup_results = []
         for cited in ev.cited_articles:
             # 각 인용 조항에 대해 article_lookup 호출
+            # cited_articles는 synthesize_step에서 {source_name, citation_id}로 생성됨
             result = self.registry.article_lookup(
                 source_name=cited.get("source_name", ""),
-                citation_id=cited.get("citation_id") or cited.get("article_no", ""),
+                citation_id=cited.get("citation_id", ""),
             )
             lookup_results.append({
-                "cited":  cited,           # 인용 정보 {"source_name": ..., "article_no": ...}
-                "found":  result,          # DB에서 찾은 원문 (없으면 None)
-                "exists": result is not None,  # 존재 여부 플래그
+                "cited":  cited,
+                "found":  result,
+                "exists": result is not None,
             })
 
         if not lookup_results:
@@ -614,7 +611,7 @@ class ComplianceWorkflow(Workflow):
             ))
 
         deterministic_failed = [
-            item["cited"].get("citation_id") or item["cited"].get("article_no", "")
+            item["cited"].get("citation_id", "")
             for item in lookup_results
             if not item["exists"]
         ]
@@ -654,29 +651,25 @@ class ComplianceWorkflow(Workflow):
                     ))
 
                 else:
-                    # ── 검증 실패: 재시도 ──────────────────────────────────────
+                    # ── 검증 실패: 실패 조항만 제거하고 factcheck_step 재실행 ────
+                    # SynthesizedEvent를 다시 emit하면 LlamaIndex가 synthesize_step이
+                    # 아니라 factcheck_step(SynthesizedEvent를 받는 유일한 step)을
+                    # 다시 트리거한다. 즉 합성은 한 번만, 검증만 재시도하는 구조.
                     try:
                         # check_retry(): MAX_RETRY 초과 시 RetryExceeded 발생
                         await check_retry(ctx)
                         logger.warning(
                             f"[factcheck] 검증 실패, 재시도: 실패 항목={failed_items}"
                         )
-                        # 실패한 조항을 제거하고 synthesize_step 재실행
-                        # → SynthesizedEvent를 다시 emit하면 LlamaIndex가
-                        #   synthesize_step이 아닌 factcheck_step을 트리거하지 않도록
-                        #   주의: 이 경우 re-emit이 synthesize_step을 직접 트리거하지 않음
-                        #   실제로는 조항을 제거한 SynthesizedEvent를 factcheck_step이 다시 받음
                         return SynthesizedEvent(
                             query=ev.query,
                             verdict=ev.verdict,
                             reasoning=ev.reasoning + f" [재시도: {failed_items} 조항 불일치]",
-                            # 검증 실패한 조항을 제거한 리스트
                             cited_articles=[
                                 c for c in ev.cited_articles
-                                if (c.get("citation_id") or c.get("article_no")) not in failed_items
+                                if c.get("citation_id") not in failed_items
                             ],
                             risk_level=ev.risk_level,
-                            retry_count=ev.retry_count + 1,  # 재시도 카운터 증가
                         )
 
                     except RetryExceeded:
@@ -906,9 +899,8 @@ class ComplianceWorkflow(Workflow):
         for item in lookups:
             status = "✓ 존재" if item["exists"] else "✗ 미존재"
             cited = item["cited"]
-            citation_id = cited.get("citation_id") or cited.get("article_no", "")
             lines.append(
-                f"  - {cited.get('source_name','')} {citation_id} : {status}"
+                f"  - {cited.get('source_name','')} {cited.get('citation_id','')} : {status}"
             )
         return "\n".join(lines)
 

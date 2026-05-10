@@ -112,11 +112,9 @@ class SynthesizedEvent(Event):
 
     cited_articles가 factcheck의 핵심 입력:
       factcheck_step은 이 리스트의 각 조항이 실제로 존재하는지 검증한다.
-      예: [{"source_name": "표준투자권유준칙", "article_no": "제5조"}, ...]
+      예: [{"source_name": "표준투자권유준칙", "citation_id": "제5조"}, ...]
 
-    retry_count:
-      factcheck 실패 시 이 이벤트가 재emit된다 (최대 1회).
-      retry_count로 무한 루프를 방지한다.
+    재시도 카운터는 ctx.store("retry_count")에 보관된다 (circuit_breaker.check_retry).
     """
     query:           str
     verdict:         str          # "가능" | "불가" | "조건부 가능" (LLM이 생성)
@@ -125,7 +123,6 @@ class SynthesizedEvent(Event):
                                   # 형식: [{"source_name": "...", "citation_id": "..."}, ...]
                                   # synthesize_step에서 코드가 evidence_id로부터 재구성한다
     risk_level:      int          # 위험 수준: 1(저), 2(중), 3(고)
-    retry_count:     int = 0      # factcheck 재시도 횟수 (기본값 0)
 
 
 # =============================================================================

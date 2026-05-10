@@ -176,33 +176,30 @@ def _make_lookup_fn() -> LookupFn:
 
     키 형식: "{source_name}||{citation_id}"
       예: "표준투자권유준칙||제5조", "금융투자회사표준내부통제기준||2.2.1"
+
+    캐시: 첫 호출 시 1회 로드 후 클로저 변수에 보관한다.
+    factcheck/validate 단계에서 한 쿼리당 10~20회 호출되며,
+    파일 크기가 1MB+이므로 매 호출 디스크 I/O는 무시할 수 없는 비용이다.
     """
+    cache: dict[str, dict] | None = None
+
     def lookup_fn(source_name: str, citation_id: str) -> Optional[dict]:
         """
         규정명과 표준 인용 ID로 원문을 조회한다.
 
-        Args:
-            source_name: 규정명 (예: "표준투자권유준칙")
-            citation_id: 표준 인용 ID (예: "제5조", "2.2.1", "2013나2021183-1")
-
         Returns:
             조항 원문 딕셔너리, 없으면 None
-            형식: {"doc_id": ..., "source_name": ..., "article_no": ..., "text": ...}
         """
-        # JSON 파일 존재 여부 확인 (ingest.py가 실행되지 않았을 경우 대비)
-        if not LOOKUP_INDEX_PATH.exists():
-            logger.warning("article_lookup.json 없음 — ingest.py 먼저 실행 필요")
-            return None
+        nonlocal cache
+        if cache is None:
+            if not LOOKUP_INDEX_PATH.exists():
+                logger.warning("article_lookup.json 없음 — ingest.py 먼저 실행 필요")
+                return None
+            with open(LOOKUP_INDEX_PATH, "r", encoding="utf-8") as f:
+                cache = json.load(f)
 
-        # JSON 파일을 딕셔너리로 로드
-        # 주의: 매 호출마다 파일을 읽음 — 성능보다 단순성을 우선 (포트폴리오용)
-        with open(LOOKUP_INDEX_PATH, "r", encoding="utf-8") as f:
-            lookup = json.load(f)
-
-        # || 구분자로 키 구성 (article_lookup.json의 키 형식과 동일)
         key = f"{source_name}||{citation_id}"
-        result = lookup.get(key)  # 없으면 None 반환
-
+        result = cache.get(key)
         if not result:
             logger.warning(f"조항 미존재: {key}")  # factcheck 실패 원인 추적용
         return result
