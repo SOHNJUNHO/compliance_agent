@@ -22,6 +22,7 @@
 import os
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from llama_index.core import VectorStoreIndex, StorageContext
@@ -80,7 +81,7 @@ def chunk_to_node(chunk: ParsedChunk) -> TextNode:
     """
     return TextNode(
         text=chunk.text,        # 벡터화 대상 본문
-        id_=chunk.doc_id,       # 고유 ID
+        id_=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.doc_id)),  # UUID (Qdrant requires UUID or uint)
 
         metadata={
             # ── 에이전트 라우팅 핵심 필드 ──

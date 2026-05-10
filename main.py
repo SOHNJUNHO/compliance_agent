@@ -30,7 +30,8 @@ logging.basicConfig(
 )
 
 from langfuse import observe, get_client
-from langfuse.decorators import langfuse_context
+from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+LlamaIndexInstrumentor().instrument()
 
 # =============================================================================
 # LLM 설정 (교체 지점)
@@ -43,7 +44,7 @@ from llama_index.llms.ollama import Ollama
 
 LLM_INSTANCE = Ollama(
     model="qwen3:8b-q4_K_M",
-    request_timeout=30.0,
+    request_timeout=120.0,
     json_mode=True,
 )
 
@@ -68,7 +69,7 @@ async def run_query(query: str) -> None:
     from langfuse_setup import sync_prompts
 
     # Langfuse 루트 트레이스 입력 기록
-    langfuse_context.update_current_observation(input={"query": query})
+    get_client().update_current_span(input={"query": query})
 
     # Langfuse 프롬프트 동기화 (없으면 로컬 파일에서 업로드)
     sync_prompts()
@@ -107,7 +108,7 @@ async def run_query(query: str) -> None:
         print(f"[총 토큰 사용량] {result.token_used}")
 
         # Langfuse 루트 트레이스 출력 기록
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             output={
                 "verdict": result.verdict,
                 "factcheck_passed": result.factcheck_passed,
@@ -147,6 +148,8 @@ def main():
 
     if mode == "ingest":
         sys.path.insert(0, ".")
+        sys.path.insert(0, "data")
+        sys.path.insert(0, "workflow")
         from data.scraper import scrape_all
         from data.parser import parse_all
         from data.ingest import ingest

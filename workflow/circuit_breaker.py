@@ -104,7 +104,7 @@ async def token_guard(ctx: Context, estimated_cost: int) -> AsyncGenerator:
     """
     # ctx.get(): ctx에 저장된 값을 비동기로 읽음
     # default=0: 처음 실행 시 (아직 저장된 값 없음) 0 반환
-    token_used: int = await ctx.get("token_used", default=0)
+    token_used: int = await ctx.store.get("token_used", default=0)
 
     # 전체 예산 초과 검사
     if token_used + estimated_cost > TOKEN_BUDGET:
@@ -147,7 +147,7 @@ async def check_retry(ctx: Context) -> None:
 
     호출 위치: factcheck_step에서 검증 실패 후 재시도 직전
     """
-    retry_count: int = await ctx.get("retry_count", default=0)
+    retry_count: int = await ctx.store.get("retry_count", default=0)
 
     if retry_count >= MAX_RETRY:
         logger.warning(
@@ -157,7 +157,7 @@ async def check_retry(ctx: Context) -> None:
         raise RetryExceeded(f"재시도 {retry_count}회 초과")
 
     # 카운터 증가 후 저장 (다음 호출 시 이 값을 읽게 됨)
-    await ctx.set("retry_count", retry_count + 1)
+    await ctx.store.set("retry_count", retry_count + 1)
     logger.info(f"[circuit_breaker] 재시도 허용: {retry_count + 1}/{MAX_RETRY}")
 
 
@@ -186,9 +186,9 @@ async def record_token_usage(ctx: Context, tokens: int) -> int:
           total = await record_token_usage(ctx, 600)
           logger.info(f"누적 토큰: {total}")
     """
-    current: int = await ctx.get("token_used", default=0)
+    current: int = await ctx.store.get("token_used", default=0)
     updated = current + tokens
-    await ctx.set("token_used", updated)
+    await ctx.store.set("token_used", updated)
 
     logger.debug(f"[token] 이번 Step: +{tokens}, 누적: {updated}/{TOKEN_BUDGET}")
     return updated

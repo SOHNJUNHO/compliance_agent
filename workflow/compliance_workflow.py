@@ -34,8 +34,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from langfuse import observe
-from langfuse.decorators import langfuse_context
+from langfuse import observe, get_client
 
 from llama_index.core.workflow import (
     Workflow,      # 워크플로우 기반 클래스
@@ -168,12 +167,12 @@ class ComplianceWorkflow(Workflow):
         query: str = ev.get("query", "")
 
         # Langfuse: Step 입력 기록
-        langfuse_context.update_current_observation(input={"query": query})
+        get_client().update_current_span(input={"query": query})
 
         # ctx 초기값 설정 (이후 Step들이 읽고 업데이트함)
-        await ctx.set("token_used", 0)     # 누적 토큰 카운터
-        await ctx.set("retry_count", 0)    # factcheck 재시도 카운터
-        await ctx.set("agents_used", [])   # 실제 실행된 에이전트 기록
+        await ctx.store.set("token_used", 0)     # 누적 토큰 카운터
+        await ctx.store.set("retry_count", 0)    # factcheck 재시도 카운터
+        await ctx.store.set("agents_used", [])   # 실제 실행된 에이전트 기록
 
         # ── LLM 라우팅 ────────────────────────────────────────────────────────
         prompt = load_prompt("classify_agent")
@@ -196,7 +195,7 @@ class ComplianceWorkflow(Workflow):
         logger.info(f"[classify] 활성화 에이전트: {agent_list} | 근거: {routing_reasoning}")
 
         # Langfuse: routing_reasoning을 출력으로 기록 → 대시보드에서 LLM 판단 근거 확인 가능
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             output={"agent_list": agent_list, "routing_reasoning": routing_reasoning}
         )
 
@@ -226,7 +225,7 @@ class ComplianceWorkflow(Workflow):
         # agent_list에 "규정"이 없으면 이 에이전트는 필요 없음
         if "규정" not in ev.agent_list:
             logger.info("[search_규정] 스킵 (agent_list에 없음)")
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={"query": ev.query},
                 output={"skipped": True},
             )
@@ -243,7 +242,7 @@ class ComplianceWorkflow(Workflow):
             # HyDE: 원본 쿼리를 가상 법령 조항으로 변환해 벡터 공간 정렬 개선
             # precision_filters는 원본 쿼리 기준으로 추출 (명시된 조항번호·문서명 regex)
             hyde_query = await self._hyde_transform(ev.query)
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={
                     "query": ev.query,
                     "hyde_query": hyde_query,
@@ -258,7 +257,7 @@ class ComplianceWorkflow(Workflow):
         except Exception as e:
             # 검색 자체가 실패하면 (DB 오류 등) 스킵 처리
             logger.warning(f"[search_규정] 검색 실패: {e}")
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 output={"error": str(e), "skipped": True},
                 level="ERROR",
             )
@@ -268,10 +267,10 @@ class ComplianceWorkflow(Workflow):
             )
 
         evidence = self._validate_article_evidence(raw_results)
-        agents_used = await ctx.get("agents_used", [])
-        await ctx.set("agents_used", agents_used + ["규정"])
+        agents_used = await ctx.store.get("agents_used", [])
+        await ctx.store.set("agents_used", agents_used + ["규정"])
 
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             output={
                 "evidence_count": len(evidence),
                 "articles": self._evidence_article_labels(evidence),
@@ -301,7 +300,7 @@ class ComplianceWorkflow(Workflow):
         """법규 검색 에이전트. search_규정과 동일한 구조."""
 
         if "법규" not in ev.agent_list:
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={"query": ev.query},
                 output={"skipped": True},
             )
@@ -314,7 +313,7 @@ class ComplianceWorkflow(Workflow):
         try:
             precision_filters = self._precision_filters(ev.query, "법규")
             hyde_query = await self._hyde_transform(ev.query)
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={
                     "query": ev.query,
                     "hyde_query": hyde_query,
@@ -324,7 +323,7 @@ class ComplianceWorkflow(Workflow):
             raw_results = self.registry.law_search(query=hyde_query, **precision_filters)
         except Exception as e:
             logger.warning(f"[search_법규] 검색 실패: {e}")
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 output={"error": str(e), "skipped": True},
                 level="ERROR",
             )
@@ -334,10 +333,10 @@ class ComplianceWorkflow(Workflow):
             )
 
         evidence = self._validate_article_evidence(raw_results)
-        agents_used = await ctx.get("agents_used", [])
-        await ctx.set("agents_used", agents_used + ["법규"])
+        agents_used = await ctx.store.get("agents_used", [])
+        await ctx.store.set("agents_used", agents_used + ["법규"])
 
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             output={
                 "evidence_count": len(evidence),
                 "articles": self._evidence_article_labels(evidence),
@@ -367,7 +366,7 @@ class ComplianceWorkflow(Workflow):
         """분쟁사례 검색 에이전트. search_규정과 동일한 구조."""
 
         if "사례" not in ev.agent_list:
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={"query": ev.query},
                 output={"skipped": True},
             )
@@ -380,7 +379,7 @@ class ComplianceWorkflow(Workflow):
         try:
             precision_filters = self._precision_filters(ev.query, "사례")
             hyde_query = await self._hyde_transform(ev.query)
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 input={
                     "query": ev.query,
                     "hyde_query": hyde_query,
@@ -390,7 +389,7 @@ class ComplianceWorkflow(Workflow):
             raw_results = self.registry.case_search(query=hyde_query, **precision_filters)
         except Exception as e:
             logger.warning(f"[search_사례] 검색 실패: {e}")
-            langfuse_context.update_current_observation(
+            get_client().update_current_span(
                 output={"error": str(e), "skipped": True},
                 level="ERROR",
             )
@@ -400,11 +399,11 @@ class ComplianceWorkflow(Workflow):
             )
 
         evidence = self._validate_case_evidence(raw_results)
-        agents_used = await ctx.get("agents_used", [])
-        await ctx.set("agents_used", agents_used + ["사례"])
+        agents_used = await ctx.store.get("agents_used", [])
+        await ctx.store.set("agents_used", agents_used + ["사례"])
 
         case_nos = [item["case_no"] for item in evidence if item.get("case_no")]
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             output={"evidence_count": len(evidence), "case_nos": case_nos},
         )
         return CaseResultEvent(
@@ -483,7 +482,7 @@ class ComplianceWorkflow(Workflow):
                 }
 
                 # Langfuse: Step 입력 기록 (LLM 호출 전)
-                langfuse_context.update_current_observation(
+                get_client().update_current_span(
                     input={
                         "query": reg_ev.query,
                         "evidence_ids": list(all_evidence.keys()),
@@ -515,15 +514,15 @@ class ComplianceWorkflow(Workflow):
                 ]
 
                 # Langfuse: Step 출력 기록 (LLM 응답 후)
-                token_used = await ctx.get("token_used", 0)
-                langfuse_context.update_current_observation(
+                token_used = await ctx.store.get("token_used", 0)
+                get_client().update_current_span(
                     output={
                         "verdict": parsed.get("verdict"),
                         "risk_level": parsed.get("risk_level"),
                         "cited_count": len(cited_articles),
                         "cited_evidence_ids": parsed.get("cited_evidence_ids", []),
                     },
-                    metadata={"token_used": token_used},
+                    metadata={"token_used": str(token_used)},
                 )
 
                 return SynthesizedEvent(
@@ -580,7 +579,7 @@ class ComplianceWorkflow(Workflow):
         # article_lookup의 exact match로 존재 여부를 확인
 
         # Langfuse: Step 입력 기록
-        langfuse_context.update_current_observation(
+        get_client().update_current_span(
             input={
                 "cited_articles": ev.cited_articles,
                 "verdict_draft": ev.verdict,
@@ -601,8 +600,8 @@ class ComplianceWorkflow(Workflow):
             })
 
         if not lookup_results:
-            token_used = await ctx.get("token_used", 0)
-            agents_used = await ctx.get("agents_used", [])
+            token_used = await ctx.store.get("token_used", 0)
+            agents_used = await ctx.store.get("agents_used", [])
             return StopEvent(result=FinalAnswer(
                 query=ev.query,
                 verdict=ev.verdict,
@@ -637,11 +636,11 @@ class ComplianceWorkflow(Workflow):
 
                 if not failed_items:
                     # ── 검증 통과: 워크플로우 종료 ────────────────────────────
-                    token_used = await ctx.get("token_used", 0)
-                    agents_used = await ctx.get("agents_used", [])
-                    langfuse_context.update_current_observation(
+                    token_used = await ctx.store.get("token_used", 0)
+                    agents_used = await ctx.store.get("agents_used", [])
+                    get_client().update_current_span(
                         output={"factcheck_passed": True, "failed_items": []},
-                        metadata={"agents_used": agents_used, "token_used": token_used},
+                        metadata={"agents_used": str(agents_used), "token_used": str(token_used)},
                     )
                     return StopEvent(result=FinalAnswer(
                         query=ev.query,
@@ -683,11 +682,11 @@ class ComplianceWorkflow(Workflow):
                     except RetryExceeded:
                         # 재시도 횟수 초과: partial 결과로 강제 종료
                         logger.warning("[factcheck] 재시도 한도 초과 → 강제 종료")
-                        token_used = await ctx.get("token_used", 0)
-                        agents_used = await ctx.get("agents_used", [])
-                        langfuse_context.update_current_observation(
+                        token_used = await ctx.store.get("token_used", 0)
+                        agents_used = await ctx.store.get("agents_used", [])
+                        get_client().update_current_span(
                             output={"factcheck_passed": False, "failed_items": failed_items, "reason": "retry_exceeded"},
-                            metadata={"agents_used": agents_used, "token_used": token_used},
+                            metadata={"agents_used": str(agents_used), "token_used": str(token_used)},
                             level="WARNING",
                         )
                         return StopEvent(result=FinalAnswer(
@@ -703,8 +702,8 @@ class ComplianceWorkflow(Workflow):
 
         except BudgetExceeded:
             # 팩트체크 단계에서 토큰 초과: 검증 생략하고 종료
-            token_used = await ctx.get("token_used", 0)
-            agents_used = await ctx.get("agents_used", [])
+            token_used = await ctx.store.get("token_used", 0)
+            agents_used = await ctx.store.get("agents_used", [])
             return StopEvent(result=FinalAnswer(
                 query=ev.query,
                 verdict=ev.verdict,

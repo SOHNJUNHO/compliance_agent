@@ -64,7 +64,7 @@ LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 ```
 
-`QDRANT_COLLECTION` defaults to `compliance_agents`. `LANGFUSE_HOST` defaults to `https://cloud.langfuse.com`. You only need to set these if you use a different collection name or a self-hosted Langfuse instance.
+`QDRANT_COLLECTION` defaults to `compliance_agents`. `LANGFUSE_BASE_URL` defaults to `https://cloud.langfuse.com`. You only need to set these if you use a different collection name or a self-hosted Langfuse instance.
 
 ---
 
