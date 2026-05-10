@@ -9,7 +9,7 @@ This guide covers everything needed to run the project from scratch.
 
 | Requirement | Notes |
 |---|---|
-| **Python 3.14+** | Required by `pyproject.toml` |
+| **Python 3.11+** | Required by `pyproject.toml` |
 | **uv** | Package manager — install from [astral.sh/uv](https://astral.sh/uv) |
 | **Ollama** | Local LLM server — install from [ollama.com](https://ollama.com) |
 | **Qdrant Cloud account** | Free tier available at [cloud.qdrant.tech](https://cloud.qdrant.tech) |
@@ -38,7 +38,7 @@ ollama serve          # run in a separate terminal and keep it open
 Then pull the models (one-time, ~5 GB total):
 
 ```bash
-ollama pull qwen2.5:7b               # LLM (~4.7 GB)
+ollama pull qwen3:8b                 # LLM (~5.2 GB)
 ollama pull qwen3-embedding:0.6b     # embedding model (~0.4 GB)
 ```
 
@@ -178,5 +178,6 @@ python main.py ingest ./분쟁사례.pdf
 | `LANGFUSE_PUBLIC_KEY` | *(none)* | Langfuse public key |
 | `LANGFUSE_SECRET_KEY` | *(none)* | Langfuse secret key |
 | `LANGFUSE_HOST` | `https://cloud.langfuse.com` | Langfuse server URL |
+| `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
 | `TOKEN_BUDGET` | `32000` | Max total tokens per workflow run |
 | `STEP_TOKEN_LIMIT` | `4000` | Max tokens per individual step |

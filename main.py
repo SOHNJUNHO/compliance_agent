@@ -14,7 +14,7 @@
 # LLM 설정:
 #   Ollama를 로컬에서 실행한 후 사용한다.
 #   실행 방법: ollama serve (별도 터미널에서)
-#   모델 설치: ollama pull qwen2.5:7b
+#   모델 설치: ollama pull qwen3:8b
 # =============================================================================
 
 import asyncio
@@ -42,7 +42,7 @@ from langfuse.decorators import langfuse_context
 from llama_index.llms.ollama import Ollama
 
 LLM_INSTANCE = Ollama(
-    model="qwen2.5:7b",
+    model="qwen3:8b",
     request_timeout=30.0,
     json_mode=True,
 )

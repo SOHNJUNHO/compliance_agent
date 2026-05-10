@@ -26,7 +26,6 @@
 #   StopEvent(result=FinalAnswer)
 # =============================================================================
 
-from typing import Optional
 from llama_index.core.workflow import Event  # LlamaIndex Event 기반 클래스
 
 

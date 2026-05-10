@@ -269,7 +269,7 @@ class ToolRegistry:
             reranker=reranker,
             final_top_n=3,
         )
-        # 분쟁사례 검색 함수: source_type="분쟝사례" 고정 필터
+        # 분쟁사례 검색 함수: source_type="분쟁사례" 고정 필터
         # 사례는 본문이 길어 컨텍스트 절약을 위해 최종 2개 반환
         self.case_search = _make_search_fn(
             index=index,

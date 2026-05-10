@@ -11,7 +11,7 @@
 #     (단, Ollama는 직렬 처리이므로 실질적 병렬 실행은 아님 — README에 명시 필요)
 #
 # 5개 Step:
-#   Step 1: classify_step   — Rule-based 분류, LLM 없음
+#   Step 1: classify_step   — LLM 기반 라우팅 (constrained JSON output)
 #   Step 2a: search_규정    — 사규 검색 + 조항 exact-match 검증
 #   Step 2b: search_법규    — 법규 검색 + 조항 exact-match 검증
 #   Step 2c: search_사례    — 분쟁사례 검색 + 사건번호 metadata 검증
@@ -742,7 +742,9 @@ class ComplianceWorkflow(Workflow):
         try:
             prompt = load_prompt("hyde_agent").replace("{query}", query)
             response = await self.llm.acomplete(prompt)
-            hypothesis = response.text.strip()
+            # json_mode=True wraps the response in JSON; extract the hypothesis text
+            parsed = self._safe_json(response.text)
+            hypothesis = parsed.get("hypothesis", "").strip()
             if len(hypothesis) >= 20:
                 logger.info(f"[hyde] 가상 조항 생성 완료: {hypothesis[:80]}...")
                 return hypothesis
@@ -836,23 +838,6 @@ class ComplianceWorkflow(Workflow):
             for item in evidence
             if item.get("source_name") and item.get("citation_id")
         ]
-
-    def _format_search_results(self, results: list[dict]) -> str:
-        """
-        검색 결과 리스트를 LLM이 읽기 좋은 텍스트로 포맷한다.
-        본문은 300자로 잘라서 컨텍스트 토큰을 절약한다.
-        """
-        if not results:
-            return "(검색 결과 없음)"
-
-        lines = []
-        for i, r in enumerate(results, 1):
-            lines.append(
-                f"[{i}] {r.get('source_name','')} {r.get('citation_id','')}\n"
-                f"    {r.get('text','')[:300]}\n"   # 300자 제한으로 토큰 절약
-                f"    (유사도: {r.get('score', 0):.2f})"
-            )
-        return "\n".join(lines)
 
     def _format_synthesis_input(
         self,
