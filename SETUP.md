@@ -73,7 +73,7 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. Also writes `data/article_lookup.json` for exact-match factchecking.
 
 ```bash
-python main.py ingest
+python run_ingest.py
 ```
 
 Expected output:
@@ -149,7 +149,7 @@ After a `query` run, open [cloud.langfuse.com](https://cloud.langfuse.com):
 The system supports optional PDF input from the Financial Supervisory Service:
 
 ```bash
-python main.py ingest ./분쟁사례.pdf
+python run_ingest.py ./분쟁사례.pdf
 ```
 
 ---
@@ -162,7 +162,7 @@ python main.py ingest ./분쟁사례.pdf
 | `Unauthorized` from Qdrant | Wrong API key | Check `QDRANT_API_KEY` in `.env` |
 | `Langfuse` warnings in logs | Langfuse not configured | Set `LANGFUSE_*` env vars in `.env`, or ignore (workflow still runs) |
 | `사용자 정보 검증에 실패하였습니다` | DRF API key invalid | Only matters for re-scraping; local `data/raw/` files are used by default |
-| Empty search results | Qdrant collection empty | Run `python main.py ingest` first |
+| Empty search results | Qdrant collection empty | Run `python run_ingest.py` first |
 | Slow first query | Embedding 850 chunks | Expected — subsequent queries are faster |
 
 ---

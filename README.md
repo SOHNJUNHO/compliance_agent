@@ -82,7 +82,7 @@ cp .env.example .env                  # Qdrant Cloud / Langfuse 키 입력
 uv sync
 
 # 4. 1회 ingest (Qdrant에 영속됨)
-python main.py ingest
+python run_ingest.py
 
 # 5. 반복 query
 python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?"

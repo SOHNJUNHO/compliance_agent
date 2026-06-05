@@ -1,15 +1,14 @@
 # =============================================================================
 # main.py
 # -----------------------------------------------------------------------------
-# 역할: 프로젝트의 진입점. 두 가지 실행 모드를 제공한다.
+# 역할: 컴플라이언스 Q&A 워크플로우 실행 진입점 (query 전용).
 #
-# 모드 1: ingest — 데이터 수집/파싱/적재 파이프라인 실행
-#   python main.py ingest [pdf_path ...]
-#   → scraper → parser → ingest (VectorStoreIndex + article_lookup.json 생성)
-#
-# 모드 2: query — 컴플라이언스 질문에 대한 워크플로우 실행
+# 실행 방법:
 #   python main.py query "질문"
 #   → ComplianceWorkflow.run() → FinalAnswer 출력
+#
+# 데이터 적재는 run_ingest.py 를 먼저 실행한다:
+#   python run_ingest.py [pdf_path ...]
 #
 # LLM 설정:
 #   Ollama를 로컬에서 실행한 후 사용한다.
@@ -74,7 +73,7 @@ async def run_query(query: str) -> None:
     sync_prompts()
 
     if not Path("data/article_lookup.json").exists():
-        print("오류: data/article_lookup.json 없음. python main.py ingest를 먼저 실행하세요.")
+        print("오류: data/article_lookup.json 없음. python run_ingest.py를 먼저 실행하세요.")
         sys.exit(1)
 
     index = load_index()
@@ -133,44 +132,23 @@ async def run_query(query: str) -> None:
 def main():
     """
     사용법:
-      python main.py ingest               # PDF 없이 웹 데이터만 적재
-      python main.py ingest ./fss.pdf     # PDF 포함 적재
       python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?"
+
+    데이터 적재 (최초 1회):
+      python run_ingest.py [pdf_path ...]
     """
-    if len(sys.argv) < 2:
-        print("사용법:")
-        print("  python main.py ingest [pdf_path ...]")
-        print("  python main.py query '질문'")
+    if len(sys.argv) < 2 or sys.argv[1] != "query":
+        print("사용법: python main.py query '질문'")
+        print("데이터 적재: python run_ingest.py [pdf_path ...]")
         sys.exit(1)
 
-    mode = sys.argv[1]
-
-    if mode == "ingest":
-        sys.path.insert(0, ".")
-        sys.path.insert(0, "data")
-        sys.path.insert(0, "workflow")
-        from data.scraper import scrape_all
-        from data.parser import parse_all
-        from data.ingest import ingest
-
-        pdf_paths = sys.argv[2:]
-        raw = scrape_all(pdf_paths=pdf_paths)
-        chunks = parse_all(raw)
-        ingest(chunks)
-        print(f"적재 완료: {len(chunks)}개 청크")
-
-    elif mode == "query":
-        if len(sys.argv) < 3:
-            print("오류: 질문을 입력하세요.")
-            print("예: python main.py query '65세 고객에게 레버리지 ETF 권유 가능한가요?'")
-            sys.exit(1)
-
-        query = sys.argv[2]
-        asyncio.run(run_query(query))
-
-    else:
-        print(f"오류: 알 수 없는 모드 '{mode}' (ingest 또는 query)")
+    if len(sys.argv) < 3:
+        print("오류: 질문을 입력하세요.")
+        print("예: python main.py query '65세 고객에게 레버리지 ETF 권유 가능한가요?'")
         sys.exit(1)
+
+    query = sys.argv[2]
+    asyncio.run(run_query(query))
 
 
 if __name__ == "__main__":

@@ -276,13 +276,13 @@ def load_index() -> VectorStoreIndex:
     """
     기존 Qdrant 컬렉션에서 VectorStoreIndex를 로드한다. 재임베딩 없음.
 
-    query 모드 전용. python main.py ingest를 먼저 실행해야 한다.
+    query 모드 전용. python run_ingest.py를 먼저 실행해야 한다.
     LlamaIndex가 쿼리 텍스트만 임베딩하고, 저장된 벡터는 그대로 사용한다.
     """
     if not USE_QDRANT:
         raise RuntimeError(
             "USE_QDRANT=0: query 모드는 Qdrant가 필요합니다. "
-            "먼저 python main.py ingest를 실행하거나 USE_QDRANT=1로 설정하세요."
+            "먼저 python run_ingest.py를 실행하거나 USE_QDRANT=1로 설정하세요."
         )
 
     from qdrant_client import QdrantClient
@@ -293,14 +293,14 @@ def load_index() -> VectorStoreIndex:
     if not client.collection_exists(QDRANT_COLLECTION):
         raise RuntimeError(
             f"Qdrant 컬렉션 '{QDRANT_COLLECTION}'이 없습니다. "
-            "python main.py ingest를 먼저 실행하세요."
+            "python run_ingest.py를 먼저 실행하세요."
         )
 
     count = client.count(QDRANT_COLLECTION).count
     if count == 0:
         raise RuntimeError(
             f"Qdrant 컬렉션 '{QDRANT_COLLECTION}'이 비어 있습니다. "
-            "python main.py ingest를 실행하세요."
+            "python run_ingest.py를 실행하세요."
         )
 
     logger.info(f"[qdrant] 기존 컬렉션 로드: {QDRANT_COLLECTION} ({count}개 벡터)")
@@ -323,31 +323,3 @@ def ingest(chunks: list[ParsedChunk]) -> VectorStoreIndex:
     index = build_vector_index(chunks)   # 1. 벡터 인덱스
     build_lookup_index(chunks)           # 2. exact-match 인덱스
     return index
-
-
-# =============================================================================
-# 전체 파이프라인 독립 실행 진입점
-# =============================================================================
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, ".")  # 현재 디렉토리를 모듈 검색 경로에 추가
-
-    from scraper import scrape_all
-    from parser import parse_all
-
-    # PDF 경로는 커맨드라인 인자로 전달
-    # 예: python ingest.py ./분쟁사례.pdf
-    pdf_paths = sys.argv[1:] if len(sys.argv) > 1 else []
-
-    print("=== 1. 수집 ===")
-    raw_docs = scrape_all(pdf_paths=pdf_paths)
-
-    print("=== 2. 파싱 ===")
-    chunks = parse_all(raw_docs)
-
-    print("=== 3. 적재 ===")
-    index = ingest(chunks)
-
-    print(f"\n완료: {len(chunks)}개 청크 적재됨")
-    print(f"article_lookup 인덱스: {LOOKUP_INDEX_PATH}")
