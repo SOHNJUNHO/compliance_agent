@@ -175,6 +175,8 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
                 collection_name=QDRANT_COLLECTION,
             )
         except Exception as e:
+            if USE_QDRANT:
+                raise RuntimeError(f"USE_QDRANT=1이지만 Qdrant 초기화 실패: {e}") from e
             logger.warning(f"Qdrant 초기화 실패, 인메모리 VectorStore 사용: {e}")
 
     if vector_store is not None:

@@ -621,7 +621,7 @@ class ComplianceWorkflow(Workflow):
             ))
 
         deterministic_failed = [
-            item["cited"].citation_id
+            f"{item['cited'].source_name}||{item['cited'].citation_id}"
             for item in lookup_results
             if not item["exists"]
         ]
@@ -676,7 +676,7 @@ class ComplianceWorkflow(Workflow):
                 reasoning=ev.reasoning + f" [재시도: {failed_items} 조항 불일치]",
                 cited_articles=[
                     c for c in ev.cited_articles
-                    if c.citation_id not in failed_items
+                    if f"{c.source_name}||{c.citation_id}" not in failed_items
                 ],
                 risk_level=ev.risk_level,
             )

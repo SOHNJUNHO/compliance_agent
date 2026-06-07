@@ -185,7 +185,8 @@ def format_factcheck_input(verdict: str, reasoning: str, lookups: list[dict]) ->
     for item in lookups:
         status = "✓ 존재" if item["exists"] else "✗ 미존재"
         cited = item["cited"]
+        eid = f"{cited.source_name}||{cited.citation_id}"
         lines.append(
-            f"  - {cited.source_name} {cited.citation_id} : {status}"
+            f"  - eid={eid} : {status}"
         )
     return "\n".join(lines)
