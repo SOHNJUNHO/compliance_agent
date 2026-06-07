@@ -29,14 +29,16 @@ logging.basicConfig(
 )
 
 from langfuse import observe, get_client, propagate_attributes
-from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-LlamaIndexInstrumentor().instrument()
+# Auto-instrumentation disabled to keep Langfuse traces to the 6 business steps.
+# Re-enable (uncomment) if you want raw LLM prompt/completion + token spans back.
+# from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+# LlamaIndexInstrumentor().instrument()
 
 # =============================================================================
 # LLM 설정 (교체 지점)
 # =============================================================================
 # 옵션 설명:
-#   model:           Ollama에 설치된 모델명 (ollama pull qwen2.5:7b 필요)
+#   model:           Ollama에 설치된 모델명 (ollama pull qwen3:8b-q4_K_M 필요)
 #   request_timeout: 단일 요청 최대 대기 시간 (초)
 #   json_mode:       True → Ollama가 항상 유효한 JSON을 반환하도록 강제
 from llama_index.llms.ollama import Ollama
@@ -53,7 +55,7 @@ LLM_INSTANCE = Ollama(
 # query 모드 실행 함수
 # =============================================================================
 
-@observe(name="compliance_query", as_type="span")
+@observe(name="compliance_query", as_type="span", capture_input=False, capture_output=False)
 async def run_query(query: str, user_id: str = "anonymous") -> None:
     """컴플라이언스 질문을 워크플로우에 전달하고 결과를 출력한다."""
     # sys.path.insert(0, ".")
@@ -69,10 +71,15 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
     # Langfuse 루트 트레이스 입력 기록
     client.update_current_span(input={"query": query})
 
-    # user_id를 이 trace의 모든 하위 span(LlamaIndex instrumentor가 async 워크플로우
-    # 내부에서 생성하는 span 포함)에 전파한다. OTEL baggage 기반이라 계측 경계를
-    # 넘어 유지된다. → Langfuse UI의 Users 필터가 trace 전체에 일관되게 적용된다.
-    with propagate_attributes(user_id=user_id):
+    # user_id를 이 trace의 모든 하위 @observe 스팬에 전파한다.
+    # OTEL baggage 기반이라 async 워크플로우 경계를 넘어 유지된다.
+    # → Langfuse UI의 Users 필터가 trace 전체에 일관되게 적용된다.
+    with propagate_attributes(
+        user_id=user_id,
+        session_id=user_id,                      # 한 사용자의 질의들을 한 세션으로 묶음
+        trace_name=f"compliance: {query[:60]}",  # trace 목록에 질문이 바로 보이도록
+        tags=["compliance-query"],
+    ):
         # 프롬프트 동기화는 main()에서 프로세스 시작 시 1회 수행한다 (요청 경로 아님).
 
         # load_index()가 Qdrant 컬렉션 부재/공백 시 명확한 오류를 발생시킨다.
@@ -101,7 +108,6 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
             print(f"\n[판정] {result.verdict}")
             print(f"[근거] {result.reasoning}")
             print(f"[인용 조항] {result.cited_articles}")
-            print(f"[위험도] {result.risk_level}/3")
             print(f"[팩트체크] {'통과 ✓' if result.factcheck_passed else '실패 ✗'}")
             print(f"[실행 에이전트] {result.agents_used}")
 
@@ -110,7 +116,6 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
                 output={
                     "verdict": result.verdict,
                     "factcheck_passed": result.factcheck_passed,
-                    "risk_level": result.risk_level,
                 },
                 metadata={
                     "agents_used": str(result.agents_used),
@@ -149,10 +154,14 @@ def main():
         print("예: python main.py query '65세 고객에게 레버리지 ETF 권유 가능한가요?' cust-001")
         sys.exit(1)
 
-    # 프롬프트 동기화(부트스트랩)는 요청 경로가 아니라 프로세스 시작 시 1회만 수행한다.
-    # sync_prompts()는 멱등이라 재호출해도 안전하다.
-    from workflow.langfuse_setup import sync_prompts
-    sync_prompts()
+    # 프롬프트 프로비저닝은 배포/개발 단계의 책임이다 (manage_prompts.py).
+    # 서빙 경로는 기본적으로 동기화하지 않는다 — load_prompt()가 사용 시점에 Langfuse에서
+    # lazy하게 가져오고, 실패 시 로컬 prompts/*.txt 로 fallback한다.
+    # 최초 부트스트랩이 필요하면: LANGFUSE_SYNC_PROMPTS=1 python main.py query ...
+    import os
+    if os.getenv("LANGFUSE_SYNC_PROMPTS") == "1":
+        from workflow.langfuse_setup import sync_prompts
+        sync_prompts()
 
     query = sys.argv[2]
     user_id = sys.argv[3] if len(sys.argv) > 3 else "anonymous"

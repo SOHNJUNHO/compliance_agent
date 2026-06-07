@@ -8,7 +8,7 @@
 #   - Workflow 클래스를 상속하고 @step 데코레이터로 Step을 정의한다.
 #   - 각 Step의 입력/출력 타입 어노테이션으로 LlamaIndex가 DAG를 자동 구성한다.
 #   - async/await 기반이므로 Step 2a/b/c는 실제로 동시에 실행된다.
-#     (단, Ollama는 직렬 처리이므로 실질적 병렬 실행은 아님 — README에 명시 필요)
+#     (단, Ollama는 직렬 처리이므로 실질적 병렬 실행은 아님 — README 참조)
 #
 # 5개 Step:
 #   Step 1: classify_step   — LLM 기반 라우팅 (constrained JSON output)
@@ -118,8 +118,8 @@ def load_prompt(name: str) -> str:
     Langfuse 우선:
       - Langfuse에 등록된 프롬프트를 가져와 compiled 문자열을 반환한다.
       - Langfuse 미설정 / 미연결 시 prompts/*.txt 파일로 자동 fallback한다.
-      → langfuse_setup.sync_prompts()가 앱 시작 시 로컬 파일을 Langfuse에 업로드하므로
-        일반적으로 Langfuse에서 가져오는 경로가 동작한다.
+      → 프롬프트 등록은 manage_prompts.py 로 별도 수행한다 (LANGFUSE_SYNC_PROMPTS=1 도 가능).
+        서빙 경로는 사용 시점에 lazy하게 가져오고 Langfuse 미연결 시 로컬 파일로 fallback한다.
 
     Langfuse 기반 버전 관리:
       Langfuse 대시보드에서 프롬프트를 수정하면 다음 run부터 반영된다.
@@ -166,7 +166,7 @@ class ComplianceWorkflow(Workflow):
         # **kwargs에 timeout, verbose 등이 포함됨
         # Workflow.__init__에 그대로 전달
         super().__init__(**kwargs)
-        self.llm = llm            # LLM 인스턴스 (Ollama Qwen2.5)
+        self.llm = llm            # LLM 인스턴스 (Ollama qwen3:8b-q4_K_M)
         self.registry = registry  # 검색/조회 함수를 보유한 레지스트리
 
     # =========================================================================
@@ -235,7 +235,7 @@ class ComplianceWorkflow(Workflow):
     # =========================================================================
 
     @step
-    @observe(name="classify_step", as_type="span")
+    @observe(name="classify_step", as_type="span", capture_input=False, capture_output=False)
     async def classify_step(
         self,
         ctx: Context,
@@ -313,7 +313,7 @@ class ComplianceWorkflow(Workflow):
     # =========================================================================
 
     @step
-    @observe(name="search_규정", as_type="span")
+    @observe(name="search_규정", as_type="span", capture_input=False, capture_output=False)
     async def search_규정(
         self, ctx: Context, ev: ClassifiedEvent
     ) -> RegulationResultEvent:
@@ -321,7 +321,7 @@ class ComplianceWorkflow(Workflow):
         return await self._search_lane(ctx, ev, _REGULATION_LANE)
 
     @step
-    @observe(name="search_법규", as_type="span")
+    @observe(name="search_법규", as_type="span", capture_input=False, capture_output=False)
     async def search_법규(
         self, ctx: Context, ev: ClassifiedEvent
     ) -> LawResultEvent:
@@ -329,7 +329,7 @@ class ComplianceWorkflow(Workflow):
         return await self._search_lane(ctx, ev, _LAW_LANE)
 
     @step
-    @observe(name="search_사례", as_type="span")
+    @observe(name="search_사례", as_type="span", capture_input=False, capture_output=False)
     async def search_사례(
         self, ctx: Context, ev: ClassifiedEvent
     ) -> CaseResultEvent:
@@ -435,7 +435,7 @@ class ComplianceWorkflow(Workflow):
     # =========================================================================
 
     @step
-    @observe(name="synthesize_step", as_type="span")
+    @observe(name="synthesize_step", as_type="span", capture_input=False, capture_output=False)
     async def synthesize_step(
         self,
         ctx: Context,
@@ -496,7 +496,7 @@ class ComplianceWorkflow(Workflow):
             },
         )
 
-        # ── Phase 2 (LLM): 판정·근거·risk_level + cited_evidence_ids 선택 ──
+        # ── Phase 2 (LLM): 판정·근거 + cited_evidence_ids 선택 ──
         context_str = format_synthesis_input(reg_ev, law_ev, case_ev)
         user_msg = (
             f"질문: {reg_ev.query}\n\n"
@@ -519,7 +519,6 @@ class ComplianceWorkflow(Workflow):
                 verdict="판정 불가",
                 reasoning="LLM 출력이 스키마를 위반하여 판정 보류",
                 cited_articles=[],
-                risk_level=3,
             )
 
         # ── Phase 1 (코드): cited_evidence_ids → cited_articles 재구성 ────
@@ -538,19 +537,18 @@ class ComplianceWorkflow(Workflow):
         get_client().update_current_span(
             output={
                 "verdict": parsed.verdict,
-                "risk_level": parsed.risk_level,
+                "reasoning": parsed.reasoning[:300],
                 "cited_count": len(cited_articles),
                 "cited_evidence_ids": parsed.cited_evidence_ids,
             },
         )
 
-        # verdict·risk_level은 스키마로 보장되므로 정규화·클램프가 불필요하다.
+        # verdict는 스키마로 보장되므로 정규화가 불필요하다.
         return SynthesizedEvent(
             query=reg_ev.query,
             verdict=parsed.verdict,
             reasoning=parsed.reasoning,
             cited_articles=cited_articles,   # 코드가 재구성한 검증된 목록
-            risk_level=parsed.risk_level,
         )
 
     # =========================================================================
@@ -564,7 +562,7 @@ class ComplianceWorkflow(Workflow):
     # =========================================================================
 
     @step
-    @observe(name="factcheck_step", as_type="span")
+    @observe(name="factcheck_step", as_type="span", capture_input=False, capture_output=False)
     async def factcheck_step(
         self,
         ctx: Context,
@@ -615,7 +613,6 @@ class ComplianceWorkflow(Workflow):
                 verdict=ev.verdict,
                 reasoning=ev.reasoning + " [검증 가능한 인용 없음]",
                 cited_articles=[],
-                risk_level=max(ev.risk_level, 3),
                 factcheck_passed=False,
                 agents_used=agents_used,
             ))
@@ -657,7 +654,6 @@ class ComplianceWorkflow(Workflow):
                 verdict=ev.verdict,
                 reasoning=ev.reasoning,
                 cited_articles=ev.cited_articles,
-                risk_level=ev.risk_level,
                 factcheck_passed=True,
                 agents_used=agents_used,
             ))
@@ -678,7 +674,6 @@ class ComplianceWorkflow(Workflow):
                     c for c in ev.cited_articles
                     if f"{c.source_name}||{c.citation_id}" not in failed_items
                 ],
-                risk_level=ev.risk_level,
             )
 
         # 재시도 한도 초과: partial 결과로 강제 종료
@@ -694,7 +689,6 @@ class ComplianceWorkflow(Workflow):
             verdict=ev.verdict,
             reasoning=ev.reasoning + " [일부 조항 검증 실패]",
             cited_articles=ev.cited_articles,
-            risk_level=ev.risk_level,
             factcheck_passed=False,
             agents_used=agents_used,
         ))

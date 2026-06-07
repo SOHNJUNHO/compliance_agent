@@ -12,17 +12,17 @@
 # 환경변수 (자동 읽기):
 #   LANGFUSE_PUBLIC_KEY  : Langfuse 공개 키
 #   LANGFUSE_SECRET_KEY  : Langfuse 비밀 키
-#   LANGFUSE_HOST        : Langfuse 서버 주소 (기본 https://cloud.langfuse.com)
+#   LANGFUSE_BASE_URL    : Langfuse 서버 주소 (기본 https://cloud.langfuse.com)
 #
 # Langfuse가 미설정이면:
 #   - get_client()는 비활성화(disabled) 클라이언트를 반환한다.
 #   - 모든 @observe 호출이 조용히 no-op으로 처리된다.
 #   - 워크플로우 실행에는 영향 없음.
 #
-# 사용법:
-#   from langfuse_setup import sync_prompts, get_langfuse_prompt
-#   sync_prompts()              # 앱 시작 시 1회 호출
-#   text = get_langfuse_prompt("synthesize_agent")
+# 프롬프트 관리:
+#   - 프로비저닝(신규 등록/버전 업)은 manage_prompts.py 또는 LANGFUSE_SYNC_PROMPTS=1 로 수행.
+#   - 서빙 경로는 get_langfuse_prompt()가 사용 시점에 lazy하게 가져오고,
+#     Langfuse 미연결 시 로컬 prompts/*.txt 로 fallback한다.
 # =============================================================================
 
 import logging

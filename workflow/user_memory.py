@@ -1,16 +1,18 @@
 # =============================================================================
 # user_memory.py
 # -----------------------------------------------------------------------------
-# 역할: user_id 기준으로 "사용자 메모리"를 SQLite에 영속화한다.
+# 역할: user_id 기준으로 "사용자 메모리"를 SQLite에 영속화하는 참조 모듈.
 #
-# 두 가지 메모리를 저장한다:
+# 두 가지 메모리를 정의한다:
 #   1. profile      - 고객 프로필 (나이, 투자성향 등). 적합성/적정성 판정의 입력.
 #   2. interaction  - 과거 질의·판정 이력. 감사 추적 + 맥락 제공.
 #
-# 설계 경계 (중요):
-#   이 모듈은 "애플리케이션 계층"에 속한다. 워크플로우(compliance_workflow.py)는
-#   SQLite를 직접 알지 못한다. main.py가 메모리를 읽어 워크플로우에 주입하고,
-#   결과를 다시 이 모듈로 저장한다. → 워크플로우는 순수 함수로 유지된다.
+# PoC 범위 참고:
+#   현재 main.py는 이 모듈을 import하지 않는다 (컨텍스트 주입은 PoC 범위 외).
+#   설계 의도는 다음과 같다: 이 모듈은 "애플리케이션 계층"에 속하며, 워크플로우는
+#   SQLite를 직접 알지 못한다. main.py가 메모리를 읽어 synthesize_step에 주입하고
+#   결과를 다시 이 모듈로 저장하는 방식으로 연결한다.
+#   → 워크플로우가 순수 함수를 유지하면서 사용자 맥락을 활용할 수 있다.
 #
 # ctx.store는 단일 run 동안만 유효한 휘발성 저장소이므로, run을 넘는 "기억"은
 # 반드시 이런 외부 영속 저장소가 필요하다.
@@ -59,7 +61,6 @@ def _connect() -> sqlite3.Connection:
             created_at       TEXT NOT NULL,
             query            TEXT NOT NULL,
             verdict          TEXT,
-            risk_level       INTEGER,
             reasoning        TEXT,
             factcheck_passed INTEGER
         )
@@ -117,7 +118,6 @@ def add_interaction(
     user_id: str,
     query: str,
     verdict: str | None = None,
-    risk_level: int | None = None,
     reasoning: str | None = None,
     factcheck_passed: bool | None = None,
 ) -> None:
@@ -125,10 +125,10 @@ def add_interaction(
     with _connect() as conn:
         conn.execute(
             "INSERT INTO interaction "
-            "(user_id, created_at, query, verdict, risk_level, reasoning, factcheck_passed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(user_id, created_at, query, verdict, reasoning, factcheck_passed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
-                user_id, _now(), query, verdict, risk_level, reasoning,
+                user_id, _now(), query, verdict, reasoning,
                 None if factcheck_passed is None else int(factcheck_passed),
             ),
         )
@@ -154,7 +154,6 @@ def save_interaction(user_id: str, final_answer) -> None:
         user_id=user_id,
         query=getattr(final_answer, "query", ""),
         verdict=getattr(final_answer, "verdict", None),
-        risk_level=getattr(final_answer, "risk_level", None),
         reasoning=getattr(final_answer, "reasoning", None),
         factcheck_passed=getattr(final_answer, "factcheck_passed", None),
     )
@@ -204,7 +203,7 @@ def format_memory_for_prompt(memory: dict) -> str:
         for h in history:
             lines.append(
                 f"  - [{h.get('created_at', '')[:10]}] \"{h.get('query', '')}\" "
-                f"→ {h.get('verdict', '?')} (위험도 {h.get('risk_level', '?')})"
+                f"→ {h.get('verdict', '?')}"
             )
 
     return "\n".join(lines)

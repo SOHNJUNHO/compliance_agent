@@ -1,6 +1,6 @@
 # compliance-agents
 
-증권사 임직원이 컴플라이언스 질문을 입력하면, 사규·법규·분쟁사례를 검색하여 판정(가능 / 불가 / 조건부 가능), 인용 조항, 위험도, 팩트체크 결과를 구조화된 형태로 반환하는 멀티에이전트 시스템입니다.
+증권사 임직원이 컴플라이언스 질문을 입력하면, 사규·법규·분쟁사례를 검색하여 판정(가능 / 불가 / 조건부 가능), 인용 조항, 팩트체크 결과를 구조화된 형태로 반환하는 멀티에이전트 시스템입니다.
 
 증권사 AI 에이전트 개발자 포지션 지원용 포트폴리오 프로젝트이며, 성능 최적화보다 **설계 의도의 명확성**을 우선합니다. 자세한 셋업 방법은 [SETUP.md](SETUP.md)를 참조하세요.
 
@@ -96,7 +96,7 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 | `query` (HyDE 3회 + 검색 + reranker + 합성 + 팩트체크) | ~2분 |
 | Reranker 첫 로드 (HuggingFace 다운로드) | +1회 ~1.5GB |
 
-병렬로 표시되는 Step 2a/b/c는 실제로는 Ollama가 요청을 직렬 처리하므로 wall-clock은 직렬에 가깝습니다. 토큰 budget 등은 환경변수로 조정합니다 (`TOKEN_BUDGET`, `STEP_TOKEN_LIMIT`).
+병렬로 표시되는 Step 2a/b/c는 실제로는 Ollama가 요청을 직렬 처리하므로 wall-clock은 직렬에 가깝습니다.
 
 ---
 
@@ -108,10 +108,8 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
        절차가 필요합니다. 레버리지 ETF는 고위험 상품으로, 위험 감수 능력 확인 및
        충분한 설명의무 이행이 선행되어야 합니다.
 [인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
-[위험도] 3/3
 [팩트체크] 통과 ✓
 [실행 에이전트] ['규정', '법규']
-[총 토큰 사용량] 2840
 ```
 
 ---
@@ -119,7 +117,7 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 ## 프로젝트 구조
 
 ```
-main.py                   # 진입점 (ingest / query 모드)
+main.py                   # 진입점 (query 전용; 데이터 적재는 run_ingest.py)
 data/
   scraper.py              # 로컬 raw 우선, 없으면 웹 fallback → RawDocument
   parser.py               # RawDocument → ParsedChunk (source-aware citation 단위)
@@ -129,10 +127,11 @@ data/
 workflow/
   events.py               # 모든 Event 클래스 (Workflow DAG 정의)
   tools.py                # 4개 검색/조회 함수 + ToolRegistry
-  circuit_breaker.py      # token_guard / check_retry / record_token_usage
+  evidence.py             # 근거 추출·검증·포맷 순수 함수
   compliance_workflow.py  # 5-Step Workflow 본문
   reranker.py             # Qwen3-Reranker cross-encoder (USE_RERANKER=0 비활성화)
-  langfuse_setup.py       # Langfuse 클라이언트 + 프롬프트 동기화
+  langfuse_setup.py       # Langfuse 클라이언트 + 프롬프트 관리
+  user_memory.py          # 사용자 프로필·이력 SQLite 영속화 (현재 main.py 미연결 — PoC 범위 외)
 prompts/
   classify_agent.txt      # 레인 라우팅
   hyde_agent.txt          # 쿼리 → 가상 법령 조항 변환
@@ -153,7 +152,7 @@ prompts/
 - **Query transform**: HyDE — 질문을 가상 법령 조항으로 변환 후 임베딩 (Gao et al. 2022)
 - **Routing**: `classify_agent.txt` — LLM이 의미 기반으로 레인 활성화 결정
 - **Factcheck**: `article_lookup.json` exact-match dictionary (캐시 1회 로드)
-- **Observability**: Langfuse (LlamaIndex auto-instrumentation으로 LLM/embedding 호출 자동 트레이싱). 미설정 시 no-op fallback.
+- **Observability**: Langfuse — `@observe` 수동 계측으로 6개 비즈니스 스팬(루트 + classify + search×3 + synthesize + factcheck)을 기록한다. LLM/embedding 자동 트레이싱은 비활성화되어 있다. Langfuse 미설정 시 모든 호출이 no-op fallback이 되어 워크플로우 실행에는 영향 없다.
 
 각 청크는 본문 `text`를 임베딩하고 다음 metadata를 저장합니다.
 
@@ -174,9 +173,9 @@ prompts/
 
 ## 한계 및 TODO
 
-- **LLM 호출 장애 처리는 최소 수준**: 현재는 `BudgetExceeded`(토큰 초과)만 잡습니다. Ollama 연결 끊김·타임아웃 등 실시간 LLM 장애 시 synthesize/factcheck step은 그대로 예외를 던지며 워크플로우를 중단합니다. 운영 환경에서는 retry / circuit breaker / degraded fallback 응답 / per-step deadline 등의 정교화가 필요합니다.
+- **LLM 호출 장애 처리는 최소 수준**: `_structured_predict_with_repair`가 ValidationError는 최대 1회 자가 수정, 전송 오류(httpx·ollama)는 최대 2회 지수 백오프 재시도를 수행합니다. per-step deadline / degraded fallback 응답 / circuit breaker는 구현되지 않았습니다. 운영 환경에서는 추가 정교화가 필요합니다.
 - **Ollama 직렬 처리**: Step 2a/b/c는 비동기 병렬 설계이지만 Ollama가 요청을 순차 처리하므로 실제 wall-clock 병렬화는 안 됩니다. 동시 추론이 가능한 모델 서버로 LLM을 교체해야 합니다.
-- **토큰 카운트는 추정값**: `circuit_breaker.py`의 `estimated_tokens`는 상수이며 실제 사용량과 다릅니다. 정확한 값은 LLM 응답의 `usage` 필드를 파싱해야 합니다. HyDE 호출은 budget에 포함되지 않습니다.
+- **토큰 사용량 추적은 미구현**: LLM 응답의 `usage` 필드 파싱 및 per-run 토큰 집계는 구현되지 않았습니다. 운영 환경에서는 Langfuse 트레이스의 `usage` 스팬 또는 별도 계측으로 추가할 수 있습니다.
 - **PDF 파서는 best-effort**: 금감원 분쟁사례 PDF의 사례 경계 regex는 표준 형식 가정에 의존합니다. 다른 PDF는 별도 검증이 필요합니다.
 - **법제처 DRF API 의존**: 법규/판례 재수집은 OC 키 + 등록된 IP가 필요합니다. 평소 실행은 `data/raw/` 캐시로 충당됩니다.
 - **Query 결과는 stdout만**: 실행 이력이 필요하면 Langfuse 트레이스를 활용하거나 `main.py`에 파일/DB 출력을 추가하세요.

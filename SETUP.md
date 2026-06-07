@@ -103,14 +103,12 @@ Expected output shape:
 [판정] 조건부 가능
 [근거] 표준투자권유준칙 제14조에 따라 고령투자자에게는 별도의 적합성 확인 절차가 필요합니다...
 [인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
-[위험도] 3/3
 [팩트체크] 통과 ✓
 [실행 에이전트] ['규정', '법규']
-[총 토큰 사용량] 2840
 ```
 
-> **Note**: `query` mode re-ingests on every run (known limitation — index is not persisted between runs).  
-> If Qdrant Cloud is configured, re-ingestion is fast after the first run because the collection already holds the vectors.
+> **Note**: `query` mode loads the existing Qdrant collection — no re-embedding.
+> Run `python run_ingest.py` once (or whenever source data changes); subsequent `query` runs reuse the persisted collection.
 
 ---
 
@@ -139,8 +137,10 @@ After a `query` run, open [cloud.langfuse.com](https://cloud.langfuse.com):
 - **Traces tab**: one root trace `compliance_query` per run
   - Nested spans: `classify_step` → `search_규정` / `search_법규` / `search_사례` → `synthesize_step` → `factcheck_step`
   - Each span has structured `input` and `output` fields
-- **Prompts tab**: `synthesize_agent` and `factcheck_agent` are auto-uploaded on first query run
-  - Edit prompts directly in the Langfuse UI — changes take effect on the next run without any code change
+- **Prompts tab**: prompts are fetched lazily at query time with a local-file fallback — no auto-upload on run
+  - **First-time setup**: seed all prompts once with `python manage_prompts.py`
+  - **After editing** a local `prompts/*.txt` file: run `python manage_prompts.py` to publish a new version to Langfuse
+  - **Bootstrap flag**: `LANGFUSE_SYNC_PROMPTS=1 python main.py query ...` also triggers a one-time create-if-missing sync
 
 ---
 
@@ -180,6 +180,4 @@ python run_ingest.py ./분쟁사례.pdf
 | `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse server URL (use `https://us.cloud.langfuse.com` for US region) |
 | `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
 | `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
-| `TOKEN_BUDGET` | `32000` | Max total tokens per workflow run |
-| `STEP_TOKEN_LIMIT` | `4000` | Max tokens per individual step |
 | `DRF_OC` | *(empty)* | law.go.kr open-API key — only needed to re-scrape `법규`/판례 (cached `data/raw/` covers normal runs) |

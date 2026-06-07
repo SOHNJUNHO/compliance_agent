@@ -29,30 +29,12 @@
 from typing import Annotated, Literal
 
 from llama_index.core.workflow import Event  # LlamaIndex Event 기반 클래스
-from pydantic import BaseModel, BeforeValidator, Field  # Event가 Pydantic BaseModel이므로 제약 조건을 그대로 사용 가능
+from pydantic import BaseModel, Field  # Event가 Pydantic BaseModel이므로 제약 조건을 그대로 사용 가능
 
 AgentName = Literal["규정", "법규", "사례"]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]  # LLM 자신감 점수 (범위 강제)
 LLMVerdict = Literal["가능", "불가", "조건부 가능"]    # LLM이 직접 고르는 판정 (단일 출처)
 Verdict = LLMVerdict | Literal["판정 불가"]            # + 코드 폴백(토큰 초과·검증 실패 등) = 상위 집합
-
-# 위험 수준 1(저)·2(중)·3(고).
-# 두 종류로 나눈다 — 코드 버그는 fail-loud, LLM 잡음은 보정(clamp):
-#   RiskLevel    : 이벤트(코드 생성) 전용. 범위 밖이면 ValidationError로 버그를 드러낸다.
-#   LLMRiskLevel : LLM 경계 전용. risk_level은 ordinal이라 5→3 같은 안전한 보정이 가능하므로
-#                  거부 대신 클램프한다(판정 전체를 폐기하지 않음). verdict는 categorical이라
-#                  안전한 보정이 없어 그대로 거부한다.
-RiskLevel = Annotated[int, Field(ge=1, le=3)]
-
-
-def _clamp_risk(v: object) -> int:
-    try:
-        return max(1, min(3, int(v)))
-    except (TypeError, ValueError):
-        return 3  # 숫자로 해석 불가 → 보수적으로 최고 위험
-
-
-LLMRiskLevel = Annotated[int, BeforeValidator(_clamp_risk), Field(ge=1, le=3)]
 
 
 class CitedArticle(BaseModel):
@@ -161,7 +143,6 @@ class SynthesizedEvent(Event):
     verdict:         Verdict           # "가능" | "불가" | "조건부 가능" (LLM이 생성)
     reasoning:       str               # 판정 근거 설명
     cited_articles:  list[CitedArticle]  # 인용된 조항 목록 (synthesize가 evidence_id로 재구성)
-    risk_level:      RiskLevel         # 위험 수준: 1(저), 2(중), 3(고)
 
 
 # =============================================================================
@@ -180,7 +161,6 @@ class FinalAnswer(Event):
     verdict:          Verdict            # 최종 판정
     reasoning:        str               # 최종 근거
     cited_articles:   list[CitedArticle]  # 검증 완료된 인용 조항
-    risk_level:       RiskLevel         # 위험 수준
     factcheck_passed: bool         # 팩트체크 통과 여부 (신뢰도 지표)
 
     # 포트폴리오 설명용 메타 정보
@@ -191,11 +171,11 @@ class FinalAnswer(Event):
 # LLM 구조화 출력(structured output) 스키마
 # -----------------------------------------------------------------------------
 # Event가 아니라 LLM 입출력 계약이다(Step 간 라우팅에 쓰이지 않으므로 Event 미상속).
-# 위의 공유 타입(LLMVerdict·RiskLevel)을 재사용하기 위해 같은 모듈에 둔다.
+# 위의 공유 타입(LLMVerdict)을 재사용하기 위해 같은 모듈에 둔다.
 #
 # astructured_predict()가 이 스키마를 Ollama format= 으로 전달하면 디코딩 자체가
 # 스키마로 제약되고(잘못된 토큰 생성 불가), 응답은 Pydantic으로 검증된다.
-# → verdict/risk_level이 허용 집합 밖일 수 없어 코드 측 정규화·클램프가 불필요.
+# → verdict가 허용 집합 밖일 수 없어 코드 측 정규화가 불필요.
 # =============================================================================
 
 class SynthesisResponse(BaseModel):
@@ -204,12 +184,10 @@ class SynthesisResponse(BaseModel):
 
     verdict는 LLM이 고를 수 있는 3개(LLMVerdict)로 한정한다.
     "판정 불가"는 코드 폴백 전용이라 스키마에서 제외한다.
-    risk_level은 LLMRiskLevel — 범위 밖이면 거부가 아니라 1~3으로 클램프한다.
     """
     verdict:            LLMVerdict
     reasoning:          str
     cited_evidence_ids: list[str]
-    risk_level:         LLMRiskLevel
 
 
 class ClassifyResponse(BaseModel):
