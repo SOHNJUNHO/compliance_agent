@@ -26,42 +26,85 @@
 # 이 설계의 정당성:
 #   금융 컴플라이언스 도메인은 LLM의 자율적 판단이 위험하다.
 #   Rule이 통제하고 LLM은 해석에만 집중 = "Rule-based & LLM Hybrid"
-#   (신한투자증권 공고의 핵심 요구사항과 일치)
 # =============================================================================
 
+import asyncio
+import json
 import logging
-import re
+from dataclasses import dataclass
 from typing import Optional
+
+import httpx
+import ollama
+
+from pydantic import ValidationError
 
 from langfuse import observe, get_client
 
 from llama_index.core.workflow import (
     Workflow,      # 워크플로우 기반 클래스
-    StartEvent,    # 워크플로우 시작 이벤트 (LlamaIndex 내장)
-    StopEvent,     # 워크플로우 종료 이벤트 (LlamaIndex 내장)
+    StartEvent,    # 워크플로우 시작 이벤트
+    StopEvent,     # 워크플로우 종료 이벤트
     Context,       # Step 간 공유 상태 저장소
     step,          # Step 정의 데코레이터
 )
 from llama_index.core.llms import LLM  # LLM 기반 클래스 (타입 힌트용)
+from llama_index.core.prompts import PromptTemplate  # 구조화 출력(structured_predict) 호출용
 
-from events import (
+from .events import (
+    CitedArticle,
     ClassifiedEvent,
     RegulationResultEvent,
     LawResultEvent,
     CaseResultEvent,
     SynthesizedEvent,
     FinalAnswer,
+    SynthesisResponse,   # LLM 구조화 출력 스키마
+    ClassifyResponse,
+    FactcheckResponse,
 )
-from tools import ToolRegistry
-from circuit_breaker import (
-    token_guard,
-    check_retry,
-    record_token_usage,
-    BudgetExceeded,
-    RetryExceeded,
+from .tools import ToolRegistry
+from .evidence import (
+    precision_filters,
+    validate_article_evidence,
+    validate_case_evidence,
+    evidence_article_labels,
+    format_synthesis_input,
+    format_factcheck_input,
 )
-
 logger = logging.getLogger(__name__)
+
+# factcheck_step이 SynthesizedEvent를 재emit하는 최대 횟수.
+# 이 값을 초과하면 partial 결과로 강제 종료 (무한 루프 방지).
+MAX_FACTCHECK_RETRY = 1
+
+# astructured_predict는 PromptTemplate에 .format()을 적용한다. 프롬프트 본문의
+# 리터럴 중괄호({ }, 예: 출력 형식 예시)가 재해석되지 않도록 전체 프롬프트를 단일
+# 치환 슬롯으로 통째로 전달한다 — 치환되는 값 안의 중괄호는 str.format이 다시 해석하지 않는다.
+_PASSTHROUGH_PROMPT = PromptTemplate("{__prompt__}")
+
+
+# =============================================================================
+# 검색 레인 기술자(descriptor)
+# -----------------------------------------------------------------------------
+# 사규/법규/사례 세 검색 Step은 본문이 거의 동일하다. 차이를 데이터로 표현해
+# _search_lane() 하나로 합치고, @step 메서드는 얇은 래퍼로만 남긴다.
+# =============================================================================
+
+@dataclass(frozen=True)
+class _Lane:
+    name: str           # agent_list 키: "규정" / "법규" / "사례"
+    search_attr: str    # registry 메서드명: regulation_search / law_search / case_search
+    event_cls: type     # RegulationResultEvent / LawResultEvent / CaseResultEvent
+    is_case: bool       # 사례 레인은 case_nos + validate_case_evidence 사용
+    summary_label: str  # summary 문구용 표기 (규정 레인은 "사규"로 표기)
+    hyde_prompt: str    # 레인별 HyDE 프롬프트 이름 (코퍼스 형식에 맞는 가상 문서 생성)
+
+
+_REGULATION_LANE = _Lane("규정", "regulation_search", RegulationResultEvent, False, "사규", "hyde_regulation")
+_LAW_LANE        = _Lane("법규", "law_search",        LawResultEvent,        False, "법규", "hyde_law")
+_CASE_LANE       = _Lane("사례", "case_search",       CaseResultEvent,       True,  "사례", "hyde_case")
+
 
 # =============================================================================
 # 프롬프트 파일 로더
@@ -88,7 +131,7 @@ def load_prompt(name: str) -> str:
     Returns:
         프롬프트 텍스트 문자열
     """
-    from langfuse_setup import get_langfuse_prompt
+    from .langfuse_setup import get_langfuse_prompt
     return get_langfuse_prompt(name)
 
 
@@ -127,6 +170,63 @@ class ComplianceWorkflow(Workflow):
         self.registry = registry  # 검색/조회 함수를 보유한 레지스트리
 
     # =========================================================================
+    # 내부 헬퍼: 구조화 출력 + 복구·전송 재시도
+    # =========================================================================
+
+    async def _structured_predict_with_repair(
+        self,
+        output_cls,
+        prompt_text: str,
+        *,
+        max_repair: int = 1,
+        max_transport_retry: int = 2,
+    ):
+        """
+        astructured_predict 래퍼 — 두 가지 실패를 자동으로 처리한다.
+
+        ValidationError (스키마 실패):
+          오류 메시지를 프롬프트에 되먹여 최대 max_repair회 재요청.
+          한도 초과 시 ValidationError를 그대로 올려 호출부의 폴백 정책을 유지한다.
+
+        httpx / ollama 전송 오류 (네트워크·타임아웃):
+          지수 백오프(0.5s → 1s)로 최대 max_transport_retry회 재시도.
+          한도 초과 시 예외를 그대로 올려 fail-loud 정책을 유지한다.
+        """
+        repair_prompt, repairs, transport = prompt_text, 0, 0
+        while True:
+            try:
+                return await self.llm.astructured_predict(
+                    output_cls, _PASSTHROUGH_PROMPT, __prompt__=repair_prompt
+                )
+            except ValidationError as e:
+                if repairs >= max_repair:
+                    raise
+                repairs += 1
+                logger.warning(
+                    f"[repair] 스키마 검증 실패 → 재요청 {repairs}/{max_repair}: {e}"
+                )
+                repair_prompt = (
+                    f"{prompt_text}\n\n"
+                    f"[직전 응답이 스키마 검증에 실패했습니다]\n"
+                    f"오류: {e}\n"
+                    f"동일한 JSON 스키마로 수정해 다시 출력하세요."
+                )
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                ollama.ResponseError,
+            ) as e:
+                if transport >= max_transport_retry:
+                    raise
+                transport += 1
+                wait = 0.5 * 2 ** (transport - 1)
+                logger.warning(
+                    f"[transport] Ollama 통신 실패 → {wait}s 후 재시도 "
+                    f"{transport}/{max_transport_retry}: {e}"
+                )
+                await asyncio.sleep(wait)
+
+    # =========================================================================
     # Step 1: classify_step
     # -------------------------------------------------------------------------
     # 입력: StartEvent (query 포함)
@@ -150,7 +250,7 @@ class ComplianceWorkflow(Workflow):
 
         안전 경계:
           LLM은 레인 활성화(넓고 복구 가능한 결정)만 담당한다.
-          source_name·citation_id 정밀 필터는 _precision_filters()에서 regex로만 처리한다.
+          source_name·citation_id 정밀 필터는 evidence.precision_filters()에서 regex로만 처리한다.
           → LLM의 잘못된 추론이 하드 AND 필터로 전파될 수 없다.
 
         fallback:
@@ -166,19 +266,25 @@ class ComplianceWorkflow(Workflow):
         get_client().update_current_span(input={"query": query})
 
         # ctx 초기값 설정 (이후 Step들이 읽고 업데이트함)
-        await ctx.store.set("token_used", 0)     # 누적 토큰 카운터
         await ctx.store.set("retry_count", 0)    # factcheck 재시도 카운터
         await ctx.store.set("agents_used", [])   # 실제 실행된 에이전트 기록
 
-        # ── LLM 라우팅 ────────────────────────────────────────────────────────
+        # ── LLM 라우팅 (구조화 출력) ──────────────────────────────────────────
+        # ClassifyResponse 스키마를 Ollama format= 으로 강제 → agents가 허용 3종으로
+        # 제한되므로 코드 측 화이트리스트 필터가 불필요하다. 스키마 위반 시
+        # ValidationError → 빈 결과로 두고 아래 fallback이 전체 레인을 연다.
         prompt = load_prompt("classify_agent")
-        response = await self.llm.acomplete(f"{prompt}\n\n질문: {query}")
-        parsed = self._safe_json(response.text)
-
-        # LLM 출력에서 허용된 값만 통과 (hallucination 차단)
-        raw_agents = parsed.get("agents", [])
-        agent_list = [a for a in raw_agents if a in {"규정", "법규", "사례"}]
-        routing_reasoning = parsed.get("reasoning", "")
+        try:
+            parsed = await self._structured_predict_with_repair(
+                ClassifyResponse,
+                f"{prompt}\n\n질문: {query}",
+            )
+            agent_list = list(parsed.agents)
+            routing_reasoning = parsed.reasoning
+        except ValidationError as e:
+            logger.warning(f"[classify] 구조화 출력 검증 실패 → 전체 에이전트 fallback: {e}")
+            agent_list = []
+            routing_reasoning = ""
 
         # ── 안전 fallback ────────────────────────────────────────────────────
         # LLM이 유효한 에이전트를 하나도 반환하지 못한 경우 전체 레인을 열어
@@ -186,7 +292,7 @@ class ComplianceWorkflow(Workflow):
         if not agent_list:
             agent_list = ["규정", "법규", "사례"]
             routing_reasoning += " [fallback: 전체 활성화]"
-            logger.warning("[classify] LLM 출력 파싱 실패 → 전체 에이전트 활성화")
+            logger.warning("[classify] 유효 에이전트 없음 → 전체 에이전트 활성화")
 
         logger.info(f"[classify] 활성화 에이전트: {agent_list} | 근거: {routing_reasoning}")
 
@@ -198,216 +304,125 @@ class ComplianceWorkflow(Workflow):
         return ClassifiedEvent(query=query, agent_list=agent_list)
 
     # =========================================================================
-    # Step 2a: search_규정
+    # Step 2a/2b/2c: 검색 레인 (search_규정 / search_법규 / search_사례)
     # -------------------------------------------------------------------------
-    # 입력: ClassifiedEvent
-    # 출력: RegulationResultEvent
-    # regulation_search 호출 (Rule-based, 고정)
+    # 입력: ClassifiedEvent → 출력: 각 레인의 ResultEvent
+    # 세 Step은 lane 기술자만 다르고 본문이 동일하므로 _search_lane에 위임한다.
+    # @step / @observe는 래퍼에 그대로 남겨 DAG 라우팅과 Langfuse span 이름을 보존한다.
+    # 검색은 Rule-based(LLM 없음)이며 source_type은 registry에서 고정된다.
     # =========================================================================
 
     @step
     @observe(name="search_규정", as_type="span")
     async def search_규정(
-        self,
-        ctx: Context,
-        ev: ClassifiedEvent  # classify_step의 출력을 받음
+        self, ctx: Context, ev: ClassifiedEvent
     ) -> RegulationResultEvent:
-        """
-        사규 검색 에이전트.
-
-        "규정"이 agent_list에 없으면 스킵 → skipped=True 이벤트 반환.
-        synthesize_step은 skipped 이벤트도 집계하므로 워크플로우가 중단되지 않는다.
-        """
-        # agent_list에 "규정"이 없으면 이 에이전트는 필요 없음
-        if "규정" not in ev.agent_list:
-            logger.info("[search_규정] 스킵 (agent_list에 없음)")
-            get_client().update_current_span(
-                input={"query": ev.query},
-                output={"skipped": True},
-            )
-            return RegulationResultEvent(
-                query=ev.query, articles=[], summary="(스킵됨)",
-                confidence=0.0, evidence=[], skipped=True,
-            )
-
-        # ── 검색 함수 실행 (Rule-based, LLM 없음) ────────────────────────
-        # regulation_search는 source_type="사규" 필터가 하드코딩됨
-        # → 법규나 분쟁사례가 섞일 수 없음
-        try:
-            precision_filters = self._precision_filters(ev.query, "규정")
-            # HyDE: 원본 쿼리를 가상 법령 조항으로 변환해 벡터 공간 정렬 개선
-            # precision_filters는 원본 쿼리 기준으로 추출 (명시된 조항번호·문서명 regex)
-            hyde_query = await self._hyde_transform(ev.query)
-            get_client().update_current_span(
-                input={
-                    "query": ev.query,
-                    "hyde_query": hyde_query,
-                    "precision_filters": precision_filters,
-                },
-            )
-            raw_results: list[dict] = self.registry.regulation_search(
-                query=hyde_query,   # 임베딩에는 가상 조항 사용
-                **precision_filters,
-            )
-            logger.info(f"[search_규정] 검색 완료: {len(raw_results)}개 결과")
-        except Exception as e:
-            # 검색 자체가 실패하면 (DB 오류 등) 스킵 처리
-            logger.warning(f"[search_규정] 검색 실패: {e}")
-            get_client().update_current_span(
-                output={"error": str(e), "skipped": True},
-                level="ERROR",
-            )
-            return RegulationResultEvent(
-                query=ev.query, articles=[], summary="검색 오류",
-                confidence=0.0, evidence=[], skipped=True,
-            )
-
-        evidence = self._validate_article_evidence(raw_results)
-        agents_used = await ctx.store.get("agents_used", [])
-        await ctx.store.set("agents_used", agents_used + ["규정"])
-
-        get_client().update_current_span(
-            output={
-                "evidence_count": len(evidence),
-                "articles": self._evidence_article_labels(evidence),
-            },
-        )
-        return RegulationResultEvent(
-            query=ev.query,
-            articles=self._evidence_article_labels(evidence),
-            summary=f"검증된 사규 근거 {len(evidence)}개",
-            confidence=1.0 if evidence else 0.0,
-            evidence=evidence,
-        )
-
-    # =========================================================================
-    # Step 2b: search_법규
-    # -------------------------------------------------------------------------
-    # Step 2a와 동일한 구조. 검색 함수만 law_search로 다름.
-    # =========================================================================
+        """사규 검색 에이전트 (→ _search_lane)."""
+        return await self._search_lane(ctx, ev, _REGULATION_LANE)
 
     @step
     @observe(name="search_법규", as_type="span")
     async def search_법규(
-        self,
-        ctx: Context,
-        ev: ClassifiedEvent
+        self, ctx: Context, ev: ClassifiedEvent
     ) -> LawResultEvent:
-        """법규 검색 에이전트. search_규정과 동일한 구조."""
-
-        if "법규" not in ev.agent_list:
-            get_client().update_current_span(
-                input={"query": ev.query},
-                output={"skipped": True},
-            )
-            return LawResultEvent(
-                query=ev.query, articles=[], summary="(스킵됨)",
-                confidence=0.0, evidence=[], skipped=True,
-            )
-
-        # law_search 호출 (source_type="법규" 고정)
-        try:
-            precision_filters = self._precision_filters(ev.query, "법규")
-            hyde_query = await self._hyde_transform(ev.query)
-            get_client().update_current_span(
-                input={
-                    "query": ev.query,
-                    "hyde_query": hyde_query,
-                    "precision_filters": precision_filters,
-                },
-            )
-            raw_results = self.registry.law_search(query=hyde_query, **precision_filters)
-        except Exception as e:
-            logger.warning(f"[search_법규] 검색 실패: {e}")
-            get_client().update_current_span(
-                output={"error": str(e), "skipped": True},
-                level="ERROR",
-            )
-            return LawResultEvent(
-                query=ev.query, articles=[], summary="검색 오류",
-                confidence=0.0, evidence=[], skipped=True,
-            )
-
-        evidence = self._validate_article_evidence(raw_results)
-        agents_used = await ctx.store.get("agents_used", [])
-        await ctx.store.set("agents_used", agents_used + ["법규"])
-
-        get_client().update_current_span(
-            output={
-                "evidence_count": len(evidence),
-                "articles": self._evidence_article_labels(evidence),
-            },
-        )
-        return LawResultEvent(
-            query=ev.query,
-            articles=self._evidence_article_labels(evidence),
-            summary=f"검증된 법규 근거 {len(evidence)}개",
-            confidence=1.0 if evidence else 0.0,
-            evidence=evidence,
-        )
-
-    # =========================================================================
-    # Step 2c: search_사례
-    # -------------------------------------------------------------------------
-    # Step 2a와 동일한 구조. 검색 함수만 case_search로 다름.
-    # =========================================================================
+        """법규 검색 에이전트 (→ _search_lane)."""
+        return await self._search_lane(ctx, ev, _LAW_LANE)
 
     @step
     @observe(name="search_사례", as_type="span")
     async def search_사례(
-        self,
-        ctx: Context,
-        ev: ClassifiedEvent
+        self, ctx: Context, ev: ClassifiedEvent
     ) -> CaseResultEvent:
-        """분쟁사례 검색 에이전트. search_규정과 동일한 구조."""
+        """분쟁사례 검색 에이전트 (→ _search_lane)."""
+        return await self._search_lane(ctx, ev, _CASE_LANE)
 
-        if "사례" not in ev.agent_list:
+    @staticmethod
+    def _skip_event(lane: _Lane, query: str, summary: str):
+        """레인 타입에 맞는 skipped=True 결과 이벤트를 생성한다."""
+        if lane.is_case:
+            return lane.event_cls(
+                query=query, case_nos=[], summary=summary,
+                confidence=0.0, evidence=[], skipped=True,
+            )
+        return lane.event_cls(
+            query=query, articles=[], summary=summary,
+            confidence=0.0, evidence=[], skipped=True,
+        )
+
+    async def _search_lane(
+        self, ctx: Context, ev: ClassifiedEvent, lane: _Lane
+    ):
+        """
+        사규/법규/사례 검색 레인의 공통 본문.
+
+        agent_list에 없으면 스킵 이벤트를 반환한다(synthesize_step이 집계하므로
+        워크플로우는 중단되지 않는다). 검색 실패 시에도 스킵 이벤트로 폴백한다.
+        """
+        # ── 스킵: agent_list에 이 레인이 없으면 검색하지 않음 ──────────────
+        if lane.name not in ev.agent_list:
+            logger.info(f"[search_{lane.name}] 스킵 (agent_list에 없음)")
             get_client().update_current_span(
                 input={"query": ev.query},
                 output={"skipped": True},
             )
-            return CaseResultEvent(
-                query=ev.query, case_nos=[], summary="(스킵됨)",
-                confidence=0.0, evidence=[], skipped=True,
-            )
+            return self._skip_event(lane, ev.query, "(스킵됨)")
 
-        # case_search 호출 (source_type="분쟁사례" 고정)
+        # ── 검색 실행 (Rule-based, LLM 없음) ───────────────────────────────
         try:
-            precision_filters = self._precision_filters(ev.query, "사례")
-            hyde_query = await self._hyde_transform(ev.query)
+            filters = precision_filters(ev.query, lane.name)
+            # HyDE: 원본 쿼리를 가상 법령 조항으로 변환해 임베딩 정렬을 개선한다.
+            # (precision_filters는 원본 쿼리 기준으로 추출 — 명시된 조항번호·문서명 regex)
+            hyde_query = await self._hyde_transform(ev.query, lane.hyde_prompt)
             get_client().update_current_span(
                 input={
                     "query": ev.query,
                     "hyde_query": hyde_query,
-                    "precision_filters": precision_filters,
+                    "precision_filters": filters,
                 },
             )
-            raw_results = self.registry.case_search(query=hyde_query, **precision_filters)
+            search_fn = getattr(self.registry, lane.search_attr)
+            raw_results: list[dict] = await search_fn(query=hyde_query, **filters)
+            logger.info(f"[search_{lane.name}] 검색 완료: {len(raw_results)}개 결과")
         except Exception as e:
-            logger.warning(f"[search_사례] 검색 실패: {e}")
+            # 검색 자체가 실패하면 (DB 오류 등) 스킵 처리
+            logger.warning(f"[search_{lane.name}] 검색 실패: {e}")
             get_client().update_current_span(
                 output={"error": str(e), "skipped": True},
                 level="ERROR",
             )
-            return CaseResultEvent(
-                query=ev.query, case_nos=[], summary="검색 오류",
-                confidence=0.0, evidence=[], skipped=True,
+            return self._skip_event(lane, ev.query, "검색 오류")
+
+        # ── 검증 + agents_used 기록 ────────────────────────────────────────
+        if lane.is_case:
+            evidence = validate_case_evidence(raw_results)
+        else:
+            evidence = validate_article_evidence(
+                raw_results, self.registry.article_lookup
+            )
+        agents_used = await ctx.store.get("agents_used", [])
+        await ctx.store.set("agents_used", agents_used + [lane.name])
+
+        summary = f"검증된 {lane.summary_label} 근거 {len(evidence)}개"
+        confidence = 1.0 if evidence else 0.0
+
+        # ── 결과 이벤트 구성 (타입별 필드 분기) ────────────────────────────
+        if lane.is_case:
+            case_nos = [item["case_no"] for item in evidence if item.get("case_no")]
+            get_client().update_current_span(
+                output={"evidence_count": len(evidence), "case_nos": case_nos},
+            )
+            return lane.event_cls(
+                query=ev.query, case_nos=case_nos, summary=summary,
+                confidence=confidence, evidence=evidence,
             )
 
-        evidence = self._validate_case_evidence(raw_results)
-        agents_used = await ctx.store.get("agents_used", [])
-        await ctx.store.set("agents_used", agents_used + ["사례"])
-
-        case_nos = [item["case_no"] for item in evidence if item.get("case_no")]
+        labels = evidence_article_labels(evidence)
         get_client().update_current_span(
-            output={"evidence_count": len(evidence), "case_nos": case_nos},
+            output={"evidence_count": len(evidence), "articles": labels},
         )
-        return CaseResultEvent(
-            query=ev.query,
-            case_nos=case_nos,
-            summary=f"검증된 사례 근거 {len(evidence)}개",
-            confidence=1.0 if evidence else 0.0,
-            evidence=evidence,
+        return lane.event_cls(
+            query=ev.query, articles=labels, summary=summary,
+            confidence=confidence, evidence=evidence,
         )
 
     # =========================================================================
@@ -458,87 +473,85 @@ class ComplianceWorkflow(Workflow):
         # LlamaIndex는 타입 선언 순서대로 반환을 보장함
         reg_ev, law_ev, case_ev = collected
 
-        estimated_tokens = 1_000  # 합성은 가장 많은 토큰 사용
+        prompt = load_prompt("synthesize_agent")
 
+        # ── Phase 1 (코드): 검증된 근거 목록을 evidence_id 기준으로 색인 ────
+        # LLM이 cited_articles를 직접 생성하면 citation_id 형식이 달라져
+        # article_lookup 테이블 키와 불일치할 수 있다.
+        # → 검증된 evidence 객체를 코드에서 직접 색인하고,
+        #   LLM에게는 evidence_id 문자열(키)만 선택하도록 위임한다.
+        all_evidence: dict[str, dict] = {
+            item["evidence_id"]: item
+            for _ev in [reg_ev, law_ev, case_ev]
+            if not _ev.skipped
+            for item in _ev.evidence
+            if item.get("evidence_id")
+        }
+
+        # Langfuse: Step 입력 기록 (LLM 호출 전)
+        get_client().update_current_span(
+            input={
+                "query": reg_ev.query,
+                "evidence_ids": list(all_evidence.keys()),
+            },
+        )
+
+        # ── Phase 2 (LLM): 판정·근거·risk_level + cited_evidence_ids 선택 ──
+        context_str = format_synthesis_input(reg_ev, law_ev, case_ev)
+        user_msg = (
+            f"질문: {reg_ev.query}\n\n"
+            f"수집된 검색 결과:\n{context_str}\n\n"
+            f"종합 판정을 JSON 형식으로 출력하세요."
+        )
+
+        # 구조화 출력: SynthesisResponse 스키마를 Ollama format= 으로 강제하고
+        # 응답을 Pydantic으로 검증해 객체로 받는다. 스키마를 벗어나면
+        # ValidationError → "판정 불가" 폴백.
         try:
-            async with token_guard(ctx, estimated_tokens):
-                prompt = load_prompt("synthesize_agent")
-
-                # ── Phase 1 (코드): 검증된 근거 목록을 evidence_id 기준으로 색인 ────
-                # LLM이 cited_articles를 직접 생성하면 citation_id 형식이 달라져
-                # article_lookup.json 키와 불일치할 수 있다.
-                # → 검증된 evidence 객체를 코드에서 직접 색인하고,
-                #   LLM에게는 evidence_id 문자열(키)만 선택하도록 위임한다.
-                all_evidence: dict[str, dict] = {
-                    item["evidence_id"]: item
-                    for _ev in [reg_ev, law_ev, case_ev]
-                    if not _ev.skipped
-                    for item in _ev.evidence
-                    if item.get("evidence_id")
-                }
-
-                # Langfuse: Step 입력 기록 (LLM 호출 전)
-                get_client().update_current_span(
-                    input={
-                        "query": reg_ev.query,
-                        "evidence_ids": list(all_evidence.keys()),
-                    },
-                )
-
-                # ── Phase 2 (LLM): 판정·근거·risk_level + cited_evidence_ids 선택 ──
-                context_str = self._format_synthesis_input(reg_ev, law_ev, case_ev)
-                user_msg = (
-                    f"질문: {reg_ev.query}\n\n"
-                    f"수집된 검색 결과:\n{context_str}\n\n"
-                    f"종합 판정을 JSON 형식으로 출력하세요."
-                )
-
-                response = await self.llm.acomplete(f"{prompt}\n\n{user_msg}")
-                parsed = self._parse_synthesis_response(response.text)
-                await record_token_usage(ctx, estimated_tokens)
-
-                # ── Phase 1 (코드): cited_evidence_ids → cited_articles 재구성 ────
-                # LLM이 선택한 evidence_id가 실제 all_evidence에 없으면 무시한다.
-                # → LLM이 evidence_id를 잘못 기재해도 hallucination이 결과에 반영되지 않는다.
-                cited_articles = [
-                    {
-                        "source_name": all_evidence[eid]["source_name"],
-                        "citation_id":  all_evidence[eid]["citation_id"],
-                    }
-                    for eid in parsed.get("cited_evidence_ids", [])
-                    if eid in all_evidence
-                ]
-
-                # Langfuse: Step 출력 기록 (LLM 응답 후)
-                token_used = await ctx.store.get("token_used", 0)
-                get_client().update_current_span(
-                    output={
-                        "verdict": parsed.get("verdict"),
-                        "risk_level": parsed.get("risk_level"),
-                        "cited_count": len(cited_articles),
-                        "cited_evidence_ids": parsed.get("cited_evidence_ids", []),
-                    },
-                    metadata={"token_used": str(token_used)},
-                )
-
-                return SynthesizedEvent(
-                    query=reg_ev.query,
-                    verdict=parsed.get("verdict", "판정 불가"),
-                    reasoning=parsed.get("reasoning", ""),
-                    cited_articles=cited_articles,   # 코드가 재구성한 검증된 목록
-                    risk_level=parsed.get("risk_level", 2),
-                )
-
-        except BudgetExceeded:
-            # 합성도 실패하면 partial 결과로 강제 종료 (무한 대기 방지)
-            logger.warning("[synthesize] 토큰 초과 → 부분 결과로 진행")
+            parsed = await self._structured_predict_with_repair(
+                SynthesisResponse,
+                f"{prompt}\n\n{user_msg}",
+            )
+        except ValidationError as e:
+            logger.warning(f"[synthesize] 구조화 출력 검증 실패 → 판정 불가 폴백: {e}")
             return SynthesizedEvent(
                 query=reg_ev.query,
-                verdict="판정 불가 (토큰 초과)",
-                reasoning="토큰 예산 초과로 합성 생략",
+                verdict="판정 불가",
+                reasoning="LLM 출력이 스키마를 위반하여 판정 보류",
                 cited_articles=[],
-                risk_level=3,   # 불확실하므로 최고 위험 등급으로 보수적 처리
+                risk_level=3,
             )
+
+        # ── Phase 1 (코드): cited_evidence_ids → cited_articles 재구성 ────
+        # LLM이 선택한 evidence_id가 실제 all_evidence에 없으면 무시한다.
+        # → LLM이 evidence_id를 잘못 기재해도 hallucination이 결과에 반영되지 않는다.
+        cited_articles = [
+            CitedArticle(
+                source_name=all_evidence[eid]["source_name"],
+                citation_id=all_evidence[eid]["citation_id"],
+            )
+            for eid in parsed.cited_evidence_ids
+            if eid in all_evidence
+        ]
+
+        # Langfuse: Step 출력 기록 (LLM 응답 후)
+        get_client().update_current_span(
+            output={
+                "verdict": parsed.verdict,
+                "risk_level": parsed.risk_level,
+                "cited_count": len(cited_articles),
+                "cited_evidence_ids": parsed.cited_evidence_ids,
+            },
+        )
+
+        # verdict·risk_level은 스키마로 보장되므로 정규화·클램프가 불필요하다.
+        return SynthesizedEvent(
+            query=reg_ev.query,
+            verdict=parsed.verdict,
+            reasoning=parsed.reasoning,
+            cited_articles=cited_articles,   # 코드가 재구성한 검증된 목록
+            risk_level=parsed.risk_level,
+        )
 
     # =========================================================================
     # Step 4: factcheck_step
@@ -566,8 +579,8 @@ class ComplianceWorkflow(Workflow):
           LlamaIndex가 이 유니온 반환 타입을 자동으로 처리한다.
 
         재시도 루프 방지:
-          check_retry()가 MAX_RETRY(=1) 초과 시 RetryExceeded 발생
-          → 재시도 없이 partial 결과로 종료
+          ctx.store("retry_count")가 MAX_FACTCHECK_RETRY(=1) 이상이면
+          더 이상 SynthesizedEvent를 재emit하지 않고 partial 결과로 종료한다.
         """
         # ── Phase 1: article_lookup으로 조항 존재 여부 확인 ────────────────
         # LLM이 "표준투자권유준칙 제5조"를 인용했다고 해서
@@ -577,7 +590,7 @@ class ComplianceWorkflow(Workflow):
         # Langfuse: Step 입력 기록
         get_client().update_current_span(
             input={
-                "cited_articles": ev.cited_articles,
+                "cited_articles": [c.model_dump() for c in ev.cited_articles],
                 "verdict_draft": ev.verdict,
             },
         )
@@ -585,10 +598,9 @@ class ComplianceWorkflow(Workflow):
         lookup_results = []
         for cited in ev.cited_articles:
             # 각 인용 조항에 대해 article_lookup 호출
-            # cited_articles는 synthesize_step에서 {source_name, citation_id}로 생성됨
             result = self.registry.article_lookup(
-                source_name=cited.get("source_name", ""),
-                citation_id=cited.get("citation_id", ""),
+                source_name=cited.source_name,
+                citation_id=cited.citation_id,
             )
             lookup_results.append({
                 "cited":  cited,
@@ -597,7 +609,6 @@ class ComplianceWorkflow(Workflow):
             })
 
         if not lookup_results:
-            token_used = await ctx.store.get("token_used", 0)
             agents_used = await ctx.store.get("agents_used", [])
             return StopEvent(result=FinalAnswer(
                 query=ev.query,
@@ -607,135 +618,120 @@ class ComplianceWorkflow(Workflow):
                 risk_level=max(ev.risk_level, 3),
                 factcheck_passed=False,
                 agents_used=agents_used,
-                token_used=token_used,
             ))
 
         deterministic_failed = [
-            item["cited"].get("citation_id", "")
+            item["cited"].citation_id
             for item in lookup_results
             if not item["exists"]
         ]
 
         # ── Phase 2: LLM 존재 여부 판정 ───────────────────────────────────────
-        estimated_tokens = 600
+        prompt = load_prompt("factcheck_agent")
 
+        # LLM에게 인용 조항 목록과 조회 결과(존재 여부)를 제공
+        # 구조화 출력: 존재하지 않는 citation_id 목록을 받는다.
+        # 스키마 위반 시 LLM 실패목록은 무시하고 결정론적 검증만 적용한다.
+        context_str = format_factcheck_input(ev.verdict, ev.reasoning, lookup_results)
         try:
-            async with token_guard(ctx, estimated_tokens):
-                prompt = load_prompt("factcheck_agent")
+            parsed = await self._structured_predict_with_repair(
+                FactcheckResponse,
+                f"{prompt}\n\n{context_str}",
+            )
+            llm_failed = parsed.failed_items
+        except ValidationError as e:
+            logger.warning(f"[factcheck] 구조화 출력 검증 실패 → LLM 실패목록 무시: {e}")
+            llm_failed = []
 
-                # LLM에게 인용 조항 목록과 조회 결과(존재 여부)를 제공
-                context_str = self._format_factcheck_input(ev, lookup_results)
-                response = await self.llm.acomplete(f"{prompt}\n\n{context_str}")
-                parsed = self._parse_factcheck_response(response.text)
-                await record_token_usage(ctx, estimated_tokens)
+        failed_items = sorted(set(llm_failed + deterministic_failed))
 
-                failed_items = sorted(set(parsed.get("failed_items", []) + deterministic_failed))
-
-                if not failed_items:
-                    # ── 검증 통과: 워크플로우 종료 ────────────────────────────
-                    token_used = await ctx.store.get("token_used", 0)
-                    agents_used = await ctx.store.get("agents_used", [])
-                    get_client().update_current_span(
-                        output={"factcheck_passed": True, "failed_items": []},
-                        metadata={"agents_used": str(agents_used), "token_used": str(token_used)},
-                    )
-                    return StopEvent(result=FinalAnswer(
-                        query=ev.query,
-                        verdict=ev.verdict,
-                        reasoning=ev.reasoning,
-                        cited_articles=ev.cited_articles,
-                        risk_level=ev.risk_level,
-                        factcheck_passed=True,
-                        agents_used=agents_used,
-                        token_used=token_used,
-                    ))
-
-                else:
-                    # ── 검증 실패: 실패 조항만 제거하고 factcheck_step 재실행 ────
-                    # SynthesizedEvent를 다시 emit하면 LlamaIndex가 synthesize_step이
-                    # 아니라 factcheck_step(SynthesizedEvent를 받는 유일한 step)을
-                    # 다시 트리거한다. 즉 합성은 한 번만, 검증만 재시도하는 구조.
-                    try:
-                        # check_retry(): MAX_RETRY 초과 시 RetryExceeded 발생
-                        await check_retry(ctx)
-                        logger.warning(
-                            f"[factcheck] 검증 실패, 재시도: 실패 항목={failed_items}"
-                        )
-                        return SynthesizedEvent(
-                            query=ev.query,
-                            verdict=ev.verdict,
-                            reasoning=ev.reasoning + f" [재시도: {failed_items} 조항 불일치]",
-                            cited_articles=[
-                                c for c in ev.cited_articles
-                                if c.get("citation_id") not in failed_items
-                            ],
-                            risk_level=ev.risk_level,
-                        )
-
-                    except RetryExceeded:
-                        # 재시도 횟수 초과: partial 결과로 강제 종료
-                        logger.warning("[factcheck] 재시도 한도 초과 → 강제 종료")
-                        token_used = await ctx.store.get("token_used", 0)
-                        agents_used = await ctx.store.get("agents_used", [])
-                        get_client().update_current_span(
-                            output={"factcheck_passed": False, "failed_items": failed_items, "reason": "retry_exceeded"},
-                            metadata={"agents_used": str(agents_used), "token_used": str(token_used)},
-                            level="WARNING",
-                        )
-                        return StopEvent(result=FinalAnswer(
-                            query=ev.query,
-                            verdict=ev.verdict,
-                            reasoning=ev.reasoning + " [일부 조항 검증 실패]",
-                            cited_articles=ev.cited_articles,
-                            risk_level=ev.risk_level,
-                            factcheck_passed=False,  # 검증 실패 표시
-                            agents_used=agents_used,
-                            token_used=token_used,
-                        ))
-
-        except BudgetExceeded:
-            # 팩트체크 단계에서 토큰 초과: 검증 생략하고 종료
-            token_used = await ctx.store.get("token_used", 0)
+        if not failed_items:
+            # ── 검증 통과: 워크플로우 종료 ────────────────────────────
             agents_used = await ctx.store.get("agents_used", [])
+            get_client().update_current_span(
+                output={"factcheck_passed": True, "failed_items": []},
+                metadata={"agents_used": str(agents_used)},
+            )
             return StopEvent(result=FinalAnswer(
                 query=ev.query,
                 verdict=ev.verdict,
-                reasoning=ev.reasoning + " [팩트체크 생략 - 토큰 초과]",
+                reasoning=ev.reasoning,
                 cited_articles=ev.cited_articles,
                 risk_level=ev.risk_level,
-                factcheck_passed=False,
+                factcheck_passed=True,
                 agents_used=agents_used,
-                token_used=token_used,
             ))
+
+        # ── 검증 실패: 실패 조항만 제거하고 factcheck_step 재실행 ────
+        # SynthesizedEvent를 다시 emit하면 LlamaIndex가 synthesize_step이
+        # 아니라 factcheck_step(SynthesizedEvent를 받는 유일한 step)을
+        # 다시 트리거한다. 즉 합성은 한 번만, 검증만 재시도하는 구조.
+        retry_count: int = await ctx.store.get("retry_count", default=0)
+        if retry_count < MAX_FACTCHECK_RETRY:
+            await ctx.store.set("retry_count", retry_count + 1)
+            logger.warning(f"[factcheck] 검증 실패, 재시도: 실패 항목={failed_items}")
+            return SynthesizedEvent(
+                query=ev.query,
+                verdict=ev.verdict,
+                reasoning=ev.reasoning + f" [재시도: {failed_items} 조항 불일치]",
+                cited_articles=[
+                    c for c in ev.cited_articles
+                    if c.citation_id not in failed_items
+                ],
+                risk_level=ev.risk_level,
+            )
+
+        # 재시도 한도 초과: partial 결과로 강제 종료
+        logger.warning("[factcheck] 재시도 한도 초과 → 강제 종료")
+        agents_used = await ctx.store.get("agents_used", [])
+        get_client().update_current_span(
+            output={"factcheck_passed": False, "failed_items": failed_items, "reason": "retry_exceeded"},
+            metadata={"agents_used": str(agents_used)},
+            level="WARNING",
+        )
+        return StopEvent(result=FinalAnswer(
+            query=ev.query,
+            verdict=ev.verdict,
+            reasoning=ev.reasoning + " [일부 조항 검증 실패]",
+            cited_articles=ev.cited_articles,
+            risk_level=ev.risk_level,
+            factcheck_passed=False,
+            agents_used=agents_used,
+        ))
 
     # =========================================================================
     # 헬퍼 메서드: 포맷터 / 파서
     # =========================================================================
 
-    async def _hyde_transform(self, query: str) -> str:
+    async def _hyde_transform(self, query: str, prompt_name: str) -> str:
         """
-        HyDE (Hypothetical Document Embedding): 원본 질문을 가상 법령 조항으로 변환한다.
+        HyDE (Hypothetical Document Embedding): 원본 질문을 레인별 코퍼스 형식의 가상 문서로 변환한다.
 
         왜 필요한가:
           질문("65세 고객에게 레버리지 ETF 권유 가능한가요?")과 코퍼스("금융투자업자는
           고령투자자에 대해 강화된 적합성 확인 절차를 적용하여야 한다")는 언어 형식과
           어휘가 달라 임베딩 벡터 공간에서 멀리 위치할 수 있다.
-          LLM이 코퍼스와 같은 법령 문체로 가상 조항을 생성하면 임베딩 공간에서
-          실제 조항과 가까워져 검색 정밀도가 높아진다.
+          LLM이 레인 코퍼스와 같은 문체로 가상 문서를 생성하면 임베딩 공간에서
+          실제 문서와 가까워져 검색 정밀도가 높아진다.
+
+        레인별 프롬프트 (prompt_name):
+          hyde_law        → 법령 조문 문체 ("금융투자업자는 ... 하여야 한다")
+          hyde_regulation → 내규·표준규정 조문 문체 ("회사는 / 임직원등은 ... 하여야 한다")
+          hyde_case       → 법원 판례 판시사항·판결요지 문체 ("... 하는지 여부(적극)")
 
         안전성:
-          가상 조항은 임베딩에만 사용되고 최종 답변에는 노출되지 않는다.
-          조항 번호 인용을 금지하므로 잘못된 citation이 생성되지 않는다.
+          가상 문서는 임베딩에만 사용되고 최종 답변에는 노출되지 않는다.
+          조항 번호·사건번호 인용을 금지하므로 잘못된 citation이 생성되지 않는다.
           실패 시 원본 쿼리를 반환하므로 워크플로우가 중단되지 않는다.
 
         Reference: Gao et al. (2022) "Precise Zero-Shot Dense Retrieval without
                    Relevance Labels", arXiv:2212.10496
         """
         try:
-            prompt = load_prompt("hyde_agent").replace("{query}", query)
+            prompt = load_prompt(prompt_name).replace("{query}", query)
             response = await self.llm.acomplete(prompt)
             # json_mode=True wraps the response in JSON; extract the hypothesis text
-            parsed = self._safe_json(response.text)
+            parsed = json.loads(response.text)
             hypothesis = parsed.get("hypothesis", "").strip()
             if len(hypothesis) >= 20:
                 logger.info(f"[hyde] 가상 조항 생성 완료: {hypothesis[:80]}...")
@@ -745,200 +741,38 @@ class ComplianceWorkflow(Workflow):
             logger.warning(f"[hyde] 생성 실패, 원본 쿼리 사용: {e}")
         return query
 
-    def _precision_filters(self, query: str, agent: str) -> dict:
-        """
-        쿼리 텍스트에서 고신뢰 신호만 추출해 메타데이터 precision filter로 변환한다.
-        source_type은 tools.py에서 이미 강제되므로 여기서는 추가 필터만 반환한다.
-
-        포함하는 필터:
-          source_name — 사용자가 쿼리에 문서명을 명시한 경우 (확실한 신호)
-          citation_id — 쿼리에 "제N조" 또는 "N.N.N" 섹션번호가 있는 경우 (확실한 신호)
-
-        제외하는 필터:
-          category   — _classify_category()의 키워드 분류는 오탐률이 높아
-                       AND 조건으로 적용하면 유효한 청크를 통째로 걸러낼 수 있음.
-                       예: 제47조가 category="기타"로 분류된 경우 "설명의무" 필터가
-                           해당 조항을 검색 결과에서 제외한다.
-        """
-        filters: dict[str, str] = {}
-
-        # ── source_name 필터: 쿼리에 문서명이 직접 언급된 경우만 적용 ──────────
-        if agent == "규정":
-            if "표준투자권유준칙" in query:
-                filters["source_name"] = "표준투자권유준칙"
-            elif "내부통제" in query or "준법감시" in query:
-                filters["source_name"] = "금융투자회사표준내부통제기준"
-        elif agent == "법규":
-            if "자본시장법" in query or "금융투자업" in query:
-                filters["source_name"] = "자본시장과금융투자업에관한법률"
-
-        # ── citation_id 필터: 조항번호·섹션번호가 명시된 경우만 적용 ────────────
-        article_match = re.search(r"제\d+조(?:의\d+)?(?:\([^)]*\))?", query)
-        if article_match and agent in {"규정", "법규"}:
-            # 괄호 제목 부분 제거: "제47조(설명의무)" → "제47조"
-            filters["citation_id"] = re.sub(r"\([^)]*\)$", "", article_match.group(0))
-
-        section_match = re.search(r"\b\d+(?:\.\d+)+\b", query)
-        if section_match and agent == "규정":
-            filters["citation_id"] = section_match.group(0)
-
-        return filters
-
-    def _validate_article_evidence(self, raw_results: list[dict]) -> list[dict]:
-        """사규/법규 검색 결과를 exact lookup으로 즉시 검증한다."""
-        evidence = []
-        for item in raw_results:
-            source_name = item.get("source_name", "")
-            citation_id = item.get("citation_id") or item.get("article_no", "")
-            if not source_name or not citation_id:
-                continue
-            lookup = self.registry.article_lookup(
-                source_name=source_name,
-                citation_id=citation_id,
-            )
-            if not lookup:
-                continue
-            verified = dict(item)
-            verified["verified"] = True
-            verified["text"] = lookup.get("text") or item.get("text", "")
-            verified["citation_id"] = lookup.get("citation_id") or citation_id
-            verified["article_no"] = lookup.get("article_no") or item.get("article_no", "")
-            verified["section_no"] = lookup.get("section_no") or item.get("section_no", "")
-            verified["case_no"] = lookup.get("case_no") or item.get("case_no", "")
-            verified["evidence_id"] = f"{source_name}||{verified['citation_id']}"
-            evidence.append(verified)
-        return evidence
-
-    def _validate_case_evidence(self, raw_results: list[dict]) -> list[dict]:
-        """사례 검색 결과는 case_no metadata 존재 여부로 검증한다."""
-        evidence = []
-        for item in raw_results:
-            case_no = item.get("case_no", "")
-            if not case_no:
-                continue
-            verified = dict(item)
-            verified["verified"] = True
-            verified["citation_id"] = item.get("citation_id") or case_no
-            verified["evidence_id"] = f"{item.get('source_name', '법원판례')}||{verified['citation_id']}"
-            evidence.append(verified)
-        return evidence
-
-    @staticmethod
-    def _evidence_article_labels(evidence: list[dict]) -> list[str]:
-        return [
-            f"{item.get('source_name', '')} {item.get('citation_id', '')}".strip()
-            for item in evidence
-            if item.get("source_name") and item.get("citation_id")
-        ]
-
-    def _format_synthesis_input(
-        self,
-        reg: RegulationResultEvent,
-        law: LawResultEvent,
-        case: CaseResultEvent,
-    ) -> str:
-        """
-        3개 에이전트 결과를 synthesize LLM에게 전달할 형태로 포맷한다.
-        skipped된 에이전트는 "(결과 없음)"으로 표시.
-        """
-        parts = []
-
-        if not reg.skipped:
-            parts.append("[사규 검증 근거]\n" + self._format_evidence_for_synthesis(reg.evidence))
-        else:
-            parts.append("[사규 검색 결과] (결과 없음)")
-
-        if not law.skipped:
-            parts.append("[법규 검증 근거]\n" + self._format_evidence_for_synthesis(law.evidence))
-        else:
-            parts.append("[법규 검색 결과] (결과 없음)")
-
-        if not case.skipped:
-            parts.append("[분쟁사례 검증 근거]\n" + self._format_evidence_for_synthesis(case.evidence))
-        else:
-            parts.append("[분쟁사례 검색 결과] (결과 없음)")
-
-        return "\n\n".join(parts)
-
-    def _format_evidence_for_synthesis(self, evidence: list[dict]) -> str:
-        """검증된 evidence 객체를 최종 합성 LLM에 전달할 형식으로 변환한다."""
-        if not evidence:
-            return "(검증된 근거 없음)"
-        lines = []
-        for i, item in enumerate(evidence, 1):
-            citation = item.get("citation_id") or item.get("article_no") or item.get("case_no", "")
-            lines.append(
-                f"[E{i}] evidence_id={item.get('evidence_id', '')}\n"
-                f"source_type={item.get('source_type', '')}\n"
-                f"source_name={item.get('source_name', '')}\n"
-                f"citation={citation}\n"
-                f"article_no={item.get('article_no', '')}\n"
-                f"section_no={item.get('section_no', '')}\n"
-                f"case_no={item.get('case_no', '')}\n"
-                f"verified={item.get('verified', False)}\n"
-                f"score={item.get('score', 0):.4f}\n"
-                f"text={item.get('text', '')[:900]}"
-            )
-        return "\n\n".join(lines)
-
-    def _format_factcheck_input(
-        self,
-        ev: SynthesizedEvent,
-        lookups: list[dict],
-    ) -> str:
-        """
-        factcheck LLM에게 전달할 컨텍스트를 포맷한다.
-        인용 조항 목록과 조회 결과(존재/미존재)를 포함한다.
-        """
-        lines = [
-            f"판정 초안: {ev.verdict}",
-            f"근거: {ev.reasoning}",
-            "",
-            "인용 조항 검증 결과:",
-        ]
-        for item in lookups:
-            status = "✓ 존재" if item["exists"] else "✗ 미존재"
-            cited = item["cited"]
-            lines.append(
-                f"  - {cited.get('source_name','')} {cited.get('citation_id','')} : {status}"
-            )
-        return "\n".join(lines)
+    # 검색 근거 추출·검증·포맷 로직은 evidence.py로 분리했다 (순수 함수).
 
     # ── LLM 응답 JSON 파서들 ────────────────────────────────────────────────
+    # json_mode=True + thinking=False로 LLM이 순수 JSON만 반환하도록 강제했으므로
+    # 방어적 추출(_safe_json)은 더 이상 필요 없다. 직접 json.loads로 파싱한다.
+    # (롤백 대비를 위해 _safe_json 구현은 삭제하지 않고 주석으로 보존한다.)
 
-    @staticmethod
-    def _safe_json(text: str) -> dict:
-        """
-        LLM 응답 텍스트에서 첫 번째 유효한 JSON 객체를 안전하게 추출한다.
-
-        기존 방식의 문제:
-          re.search(r'\\{.*\\}', text, re.DOTALL) — greedy 매칭.
-          LLM이 JSON 뒤에 설명 문장을 추가하면 마지막 }까지 통째로 잡아
-          json.loads()가 실패하고 빈 dict를 반환한다.
-
-        개선 방식:
-          json.JSONDecoder().raw_decode()는 첫 번째 완전한 JSON 객체만
-          파싱하고 나머지 텍스트(마크다운 설명 등)는 무시한다.
-          JSON 앞에 텍스트가 있으면 { 위치를 찾아 거기서부터 시도한다.
-        """
-        import json
-
-        text = text.strip()
-        # { 가 처음 등장하는 위치부터 순서대로 시도
-        for start in range(len(text)):
-            if text[start] != "{":
-                continue
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(text, start)
-                return obj
-            except json.JSONDecodeError:
-                continue  # 이 위치는 유효한 JSON 시작점이 아님 → 다음 시도
-
-        logger.warning(f"JSON 없음: {text[:100]}")
-        return {}
-
-    def _parse_synthesis_response(self, text: str) -> dict:
-        return self._safe_json(text)
-
-    def _parse_factcheck_response(self, text: str) -> dict:
-        return self._safe_json(text)
+    # @staticmethod
+    # def _safe_json(text: str) -> dict:
+    #     """
+    #     LLM 응답 텍스트에서 첫 번째 유효한 JSON 객체를 안전하게 추출한다.
+    #
+    #     기존 방식의 문제:
+    #       re.search(r'\\{.*\\}', text, re.DOTALL) — greedy 매칭.
+    #       LLM이 JSON 뒤에 설명 문장을 추가하면 마지막 }까지 통째로 잡아
+    #       json.loads()가 실패하고 빈 dict를 반환한다.
+    #
+    #     개선 방식:
+    #       json.JSONDecoder().raw_decode()는 첫 번째 완전한 JSON 객체만
+    #       파싱하고 나머지 텍스트(마크다운 설명 등)는 무시한다.
+    #       JSON 앞에 텍스트가 있으면 { 위치를 찾아 거기서부터 시도한다.
+    #     """
+    #     text = text.strip()
+    #     # { 가 처음 등장하는 위치부터 순서대로 시도
+    #     for start in range(len(text)):
+    #         if text[start] != "{":
+    #             continue
+    #         try:
+    #             obj, _ = json.JSONDecoder().raw_decode(text, start)
+    #             return obj
+    #         except json.JSONDecodeError:
+    #             continue  # 이 위치는 유효한 JSON 시작점이 아님 → 다음 시도
+    #
+    #     logger.warning(f"JSON 없음: {text[:100]}")
+    #     return {}

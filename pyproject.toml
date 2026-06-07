@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.14.3",
-    "langfuse>=4.5.0",
+    "langfuse>=4.7.1",
     "llama-index-core>=0.14.0",
     "llama-index-postprocessor-sbert-rerank>=0.3.0",
     "sentence-transformers>=3.0.0",
@@ -16,6 +16,6 @@ dependencies = [
     "llama-index-vector-stores-qdrant>=0.8.0",
     "pdfminer-six>=20260107",
     "python-dotenv>=1.0.0",
-    "qdrant-client>=1.15.0",
+    "qdrant-client>=1.18.0",
     "requests>=2.33.1",
 ]

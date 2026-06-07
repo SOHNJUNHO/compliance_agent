@@ -9,7 +9,8 @@
 #
 # 데이터 흐름:
 #   scraper.py → parser.py → ingest.py
-#   → VectorStoreIndex (Qdrant) + data/article_lookup.json
+#   → VectorStoreIndex (Qdrant)
+#   (exact-match 조회 테이블은 query 시 Qdrant 페이로드에서 구성된다)
 #
 # 사전 조건:
 #   ollama serve  (임베딩 모델 서버)

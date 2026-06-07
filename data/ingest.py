@@ -6,11 +6,10 @@
 #
 # 데이터 흐름:
 #   scraper.py → parser.py → [ingest.py] → Vector DB
-#                                         → article_lookup.json
 #
-# 두 가지 인덱스를 생성한다:
-#   1. VectorStoreIndex: 벡터 유사도 검색용 (tools.py의 search 툴들이 사용)
-#   2. article_lookup.json: 표준 인용 ID exact match 검색용 (factcheck_step이 사용)
+# VectorStoreIndex 하나를 생성한다 (벡터 유사도 검색용, tools.py의 search 툴들이 사용).
+# factcheck_step의 exact-match 조회 테이블(article_lookup)은 별도 파일로 저장하지 않고
+# query 시 load_lookup_table()이 Qdrant 페이로드에서 직접 구성한다 — 중복 저장 제거.
 #
 # 교체 지점:
 #   EMBEDDING_MODEL: Ollama 임베딩 모델 (기본 qwen3-embedding:0.6b)
@@ -20,18 +19,20 @@
 # =============================================================================
 
 import os
-import json
 import logging
 import uuid
-from pathlib import Path
 
 from llama_index.core import VectorStoreIndex, StorageContext
+# VectorStoreIndex creates a vector-search index from documents or text chunks.
+# StorageContext tells LlamaIndex where and how to store the index data.
+
 from llama_index.core.schema import TextNode
+# TextNode is a single chunk of text plus metadata.
 
 # OllamaEmbedding: Ollama에서 실행 중인 Qwen embedding 모델을 사용
 from llama_index.embeddings.ollama import OllamaEmbedding
 
-from parser import ParsedChunk
+from .parser import ParsedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +43,13 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 EMBEDDING_MODEL = OllamaEmbedding(model_name=EMBEDDING_MODEL_NAME)
 
 QDRANT_URL        = os.getenv("QDRANT_URL",        "http://localhost:6333")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "compliance_agents")
-QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY",    "")   # required for Qdrant Cloud; empty = local (no auth)
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "compliance_agent")
+QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY",    "")
 USE_QDRANT        = os.getenv("USE_QDRANT",        "1") != "0"
 QDRANT_VECTOR_DIM = int(os.getenv("QDRANT_VECTOR_DIM", "1024"))  # qwen3-embedding:0.6b output dim
 
 # Fields used in MetadataFilter — Qdrant Cloud requires a payload index on each
-PAYLOAD_INDEX_FIELDS = ["source_type", "source_name", "citation_id", "article_no", "case_no", "category"]
-
-# article_lookup.json 저장 경로
-LOOKUP_INDEX_PATH = Path("data/article_lookup.json")
+PAYLOAD_INDEX_FIELDS = ["source_type", "source_name", "citation_id", "article_no", "case_no"]
 
 
 # =============================================================================
@@ -70,8 +68,7 @@ def chunk_to_node(chunk: ParsedChunk) -> TextNode:
     metadata 설계 포인트:
       - source_type: tools.py의 MetadataFilter가 이 값으로 청크를 필터링
         예) regulation_search → source_type="사규" 인 청크만 반환
-      - keywords: 리스트를 문자열로 직렬화 (Vector DB 호환성)
-        일부 DB는 메타데이터 값으로 리스트를 지원하지 않음
+      - 워크플로우가 실제로 소비하는 필드만 저장한다 (불필요한 메타데이터 제거).
 
     excluded_embed_metadata_keys:
       임베딩 시 메타데이터 일부를 텍스트에 포함시키지 않을 필드 지정
@@ -83,7 +80,7 @@ def chunk_to_node(chunk: ParsedChunk) -> TextNode:
       url은 LLM이 직접 방문할 수 없으므로 컨텍스트에서 제외
     """
     return TextNode(
-        text=chunk.text,        # 벡터화 대상 본문
+        text=chunk.text,
         id_=str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.doc_id)),  # UUID (Qdrant requires UUID or uint)
 
         metadata={
@@ -94,22 +91,15 @@ def chunk_to_node(chunk: ParsedChunk) -> TextNode:
             "source_name": chunk.source_name,   # "표준투자권유준칙"
             "citation_id": chunk.citation_id or "",  # "제5조" | "2.2.1" | 사건번호
             "article_no":  chunk.article_no or "",  # "제5조" (없으면 빈 문자열)
-            "article_title": chunk.article_title or "",
             "section_no": chunk.section_no or "",
-            "section_title": chunk.section_title or "",
             "case_no":     chunk.case_no or "",     # "2022-증권-031"
-            "url":         chunk.url,
-            "chunk_id":     chunk.doc_id,
+            "url":         chunk.url,               # 출처 추적용 (워크플로우 미사용)
             "verified":     chunk.verified,
-
-            # ── 검색 품질 보조 필드 ──
-            "category":    chunk.category,                   # "적합성원칙"
-            "keywords":    ", ".join(chunk.keywords),         # 리스트→쉼표 구분 문자열
         },
 
         # 임베딩 시 텍스트에 포함하지 않을 메타데이터 키
         excluded_embed_metadata_keys=[
-            "url", "citation_id", "article_no", "case_no", "chunk_id", "verified",
+            "url", "citation_id", "article_no", "case_no", "verified",
         ],
 
         # LLM 컨텍스트에 전달하지 않을 메타데이터 키
@@ -140,43 +130,48 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
     vector_store = None
     if USE_QDRANT:
         try:
-            from qdrant_client import QdrantClient
-            from qdrant_client import models as qdrant_models
+            from qdrant_client import AsyncQdrantClient, QdrantClient
+            from qdrant_client import models
             from llama_index.vector_stores.qdrant import QdrantVectorStore
 
             client = QdrantClient(
                 url=QDRANT_URL,
                 api_key=QDRANT_API_KEY or None,  # None = unauthenticated (local Docker)
             )
+            aclient = AsyncQdrantClient(
+                url=QDRANT_URL,
+                api_key=QDRANT_API_KEY or None,
+            )
             logger.info(f"Qdrant 사용: {QDRANT_URL} / collection={QDRANT_COLLECTION}")
 
-            # Pre-create collection with INT8 scalar quantization if it does not exist.
+            # Pre-create collection with quantization if it does not exist.
             # LlamaIndex respects a pre-created collection and will not overwrite it.
             # To apply quantization to an existing collection, delete it in the Qdrant
             # console first, then re-run ingest.
             if not client.collection_exists(QDRANT_COLLECTION):
                 client.create_collection(
                     collection_name=QDRANT_COLLECTION,
-                    vectors_config=qdrant_models.VectorParams(
+                    vectors_config=models.VectorParams(
                         size=QDRANT_VECTOR_DIM,
-                        distance=qdrant_models.Distance.COSINE,
+                        distance=models.Distance.COSINE,
                     ),
-                    quantization_config=qdrant_models.ScalarQuantization(
-                        scalar=qdrant_models.ScalarQuantizationConfig(
-                            type=qdrant_models.ScalarType.INT8,
-                            quantile=0.99,
-                            always_ram=True,
-                        ),
-                    ),
+                    quantization_config=models.TurboQuantization(
+                            turbo=models.TurboQuantQuantizationConfig(
+                                always_ram=True,
+                                bits=models.TurboQuantBitSize.BITS4,
+                            ),
+                    )
                 )
-                logger.info(f"[qdrant] 컬렉션 생성 완료 (INT8 스칼라 양자화): {QDRANT_COLLECTION}")
+
+                logger.info(f"[qdrant] 컬렉션 생성 완료 (TurboQuant BITS4): {QDRANT_COLLECTION}")
             else:
                 logger.info(f"[qdrant] 기존 컬렉션 사용: {QDRANT_COLLECTION}")
 
-            _ensure_payload_indexes(client, QDRANT_COLLECTION, qdrant_models)
+            _ensure_payload_indexes(client, QDRANT_COLLECTION, models)
 
             vector_store = QdrantVectorStore(
                 client=client,
+                aclient=aclient,
                 collection_name=QDRANT_COLLECTION,
             )
         except Exception as e:
@@ -198,18 +193,25 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
 
 
 # =============================================================================
-# article_lookup.json 구성
+# article_lookup 테이블 구성 (Qdrant 페이로드 기반)
 # =============================================================================
 
-def build_lookup_index(chunks: list[ParsedChunk]) -> None:
+def load_lookup_table() -> dict[str, dict]:
     """
-    factcheck_step 전용 exact-match 조회 인덱스를 JSON 파일로 저장한다.
+    factcheck_step 전용 exact-match 조회 테이블을 Qdrant에서 직접 구성한다.
 
-    왜 별도 인덱스가 필요한가:
+    왜 exact-match 테이블이 필요한가:
       factcheck_step은 "표준투자권유준칙 제5조가 실제로 존재하는가"를
       확인해야 한다. 벡터 유사도 검색은 "비슷한" 문서를 찾는 것이므로
       존재 여부 확인에 적합하지 않다.
       → 키-값 딕셔너리로 O(1) exact match 조회
+
+    왜 별도 JSON 파일을 쓰지 않는가:
+      조항 원문(text)과 메타데이터는 이미 Qdrant 페이로드에 그대로 존재한다.
+      (LlamaIndex QdrantVectorStore는 text_key="text"로 본문을 평면 페이로드에
+      저장하고 메타데이터도 최상위 키로 평탄화한다.)
+      → JSON 파일은 동일 데이터의 중복본(second source of truth)이므로 제거하고,
+        query 시작 시 Qdrant를 1회 scroll하여 동일한 인메모리 딕셔너리를 만든다.
 
     키 형식: "{source_name}||{citation_id}"
       예: "표준투자권유준칙||제5조", "금융투자회사표준내부통제기준||2.2.1"
@@ -218,35 +220,53 @@ def build_lookup_index(chunks: list[ParsedChunk]) -> None:
 
     citation_id가 있는 모든 청크를 포함한다.
     """
+    if not USE_QDRANT:
+        raise RuntimeError(
+            "USE_QDRANT=0: article_lookup 테이블은 Qdrant 페이로드에서 구성됩니다. "
+            "USE_QDRANT=1로 설정하고 run_ingest.py를 먼저 실행하세요."
+        )
+
+    from qdrant_client import QdrantClient
+
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+    if not client.collection_exists(QDRANT_COLLECTION):
+        raise RuntimeError(
+            f"Qdrant 컬렉션 '{QDRANT_COLLECTION}'이 없습니다. "
+            "python run_ingest.py를 먼저 실행하세요."
+        )
+
     lookup: dict[str, dict] = {}
-
-    for chunk in chunks:
-        if chunk.citation_id:
-            key = f"{chunk.source_name}||{chunk.citation_id}"
+    offset = None
+    while True:
+        # scroll: 벡터 없이 페이로드만 페이지 단위로 순회 (재임베딩/유사도 계산 없음)
+        points, offset = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=256,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            source_name = payload.get("source_name", "")
+            citation_id = payload.get("citation_id", "")
+            if not source_name or not citation_id:
+                continue
+            key = f"{source_name}||{citation_id}"
             lookup[key] = {
-                "doc_id":      chunk.doc_id,
-                "source_type": chunk.source_type,
-                "source_name": chunk.source_name,
-                "citation_id": chunk.citation_id,
-                "article_no": chunk.article_no,
-                "article_title": chunk.article_title,
-                "section_no": chunk.section_no,
-                "section_title": chunk.section_title,
-                "case_no": chunk.case_no,
-                "url": chunk.url,
-                "chunk_id": chunk.doc_id,
-                "verified": True,
-                "text": chunk.text,
+                "source_type": payload.get("source_type", ""),
+                "source_name": source_name,
+                "citation_id": citation_id,
+                "article_no": payload.get("article_no", ""),
+                "section_no": payload.get("section_no", ""),
+                "case_no": payload.get("case_no", ""),
+                "text": payload.get("text", ""),
             }
+        if offset is None:
+            break
 
-    # JSON 파일로 저장
-    LOOKUP_INDEX_PATH.parent.mkdir(exist_ok=True)
-    with open(LOOKUP_INDEX_PATH, "w", encoding="utf-8") as f:
-        # ensure_ascii=False: 한글을 유니코드 이스케이프 없이 저장
-        # indent=2: 사람이 읽기 좋은 형태로 저장
-        json.dump(lookup, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"article_lookup 인덱스 저장: {len(lookup)}개 항목 → {LOOKUP_INDEX_PATH}")
+    logger.info(f"article_lookup 테이블 로드: {len(lookup)}개 항목 (Qdrant scroll)")
+    return lookup
 
 
 # =============================================================================
@@ -285,10 +305,11 @@ def load_index() -> VectorStoreIndex:
             "먼저 python run_ingest.py를 실행하거나 USE_QDRANT=1로 설정하세요."
         )
 
-    from qdrant_client import QdrantClient
+    from qdrant_client import AsyncQdrantClient, QdrantClient
     from llama_index.vector_stores.qdrant import QdrantVectorStore
 
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+    aclient = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
 
     if not client.collection_exists(QDRANT_COLLECTION):
         raise RuntimeError(
@@ -304,7 +325,11 @@ def load_index() -> VectorStoreIndex:
         )
 
     logger.info(f"[qdrant] 기존 컬렉션 로드: {QDRANT_COLLECTION} ({count}개 벡터)")
-    vector_store = QdrantVectorStore(client=client, collection_name=QDRANT_COLLECTION)
+    vector_store = QdrantVectorStore(
+        client=client,
+        aclient=aclient,
+        collection_name=QDRANT_COLLECTION,
+    )
     index = VectorStoreIndex.from_vector_store(vector_store, embed_model=EMBEDDING_MODEL)
     logger.info("[qdrant] VectorStoreIndex 로드 완료 (재임베딩 없음)")
     return index
@@ -319,7 +344,8 @@ def ingest(chunks: list[ParsedChunk]) -> VectorStoreIndex:
 
     Returns:
         VectorStoreIndex (tools.py의 ToolRegistry.build()에 전달)
+
+    article_lookup 테이블은 더 이상 별도 파일로 저장하지 않는다.
+    query 시 ingest.load_lookup_table()이 Qdrant 페이로드에서 직접 구성한다.
     """
-    index = build_vector_index(chunks)   # 1. 벡터 인덱스
-    build_lookup_index(chunks)           # 2. exact-match 인덱스
-    return index
+    return build_vector_index(chunks)

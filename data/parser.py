@@ -25,8 +25,6 @@
 #   section_no  : 섹션번호 (섹션형 문서 전용)
 #   case_no     : 사건번호 (분쟁사례 전용)
 #   url         : 원본 URL
-#   category    : 조항 내용 분류 (적합성원칙, 설명의무 등)
-#   keywords    : 검색 보조 키워드 리스트
 #   text        : 임베딩할 본문 (벡터 검색의 실질 대상)
 # =============================================================================
 
@@ -38,7 +36,7 @@ from dataclasses import dataclass    # ParsedChunk 정의
 from typing import Optional
 
 from bs4 import BeautifulSoup        # HTML에서 텍스트 추출
-from scraper import RawDocument      # 파이프라인 앞 단계 결과물
+from .scraper import RawDocument      # 파이프라인 앞 단계 결과물
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +66,9 @@ class ParsedChunk:
 
     # 조항형 문서 전용 필드
     article_no:  Optional[str]
-    article_title: Optional[str]
 
     # 섹션형 문서 전용 필드
     section_no: Optional[str]
-    section_title: Optional[str]
 
     # 분쟁사례 사건번호 (예: "2022-증권-031")
     # 분쟁사례 전용. 사규/법규는 None
@@ -80,13 +76,6 @@ class ParsedChunk:
 
     # 원본 URL — 출처 추적용
     url:         str
-
-    # 조항 내용 분류 (예: "적합성원칙", "설명의무")
-    # CATEGORY_MAP 규칙으로 자동 분류됨
-    category:    str
-
-    # 검색 보조 키워드 — 벡터 유사도 검색 보완용
-    keywords:    list[str]
 
     # 벡터 임베딩의 실제 대상 텍스트
     # "인용 제목\n본문" 형태로 구성
@@ -107,49 +96,6 @@ def _make_doc_id(source_type: str, source_name: str, identifier: str) -> str:
     return re.sub(r"[^\w가-힣]", "_", base)
 
 
-# =============================================================================
-# 카테고리 분류 규칙
-# -----------------------------------------------------------------------------
-# 튜플 키: 해당 카테고리를 나타내는 키워드들 (하나라도 본문에 있으면 해당 카테고리)
-# 값: 카테고리 레이블
-# 순서 중요: 위에서부터 매칭되므로 더 구체적인 규칙을 위에 배치
-# =============================================================================
-CATEGORY_MAP = {
-    ("적합", "권유", "투자자유형"):     "적합성원칙",
-    ("설명", "고지", "중요사항"):       "설명의무",
-    ("내부통제", "준법", "감시"):       "내부통제",
-    ("정보차단", "차이니즈월"):         "정보차단벽",
-    ("불건전", "금지행위"):             "불건전영업행위",
-    ("고령", "65세", "노령"):           "고령투자자보호",
-}
-
-
-def _classify_category(text: str) -> str:
-    """
-    텍스트에서 카테고리를 분류한다.
-    CATEGORY_MAP의 키워드가 하나라도 포함되면 해당 카테고리를 반환.
-    어디에도 해당하지 않으면 "기타" 반환.
-    """
-    for keywords, category in CATEGORY_MAP.items():
-        if any(kw in text for kw in keywords):
-            return category
-    return "기타"
-
-
-# 검색에 도움이 되는 금융 도메인 핵심 키워드 목록
-# 본문에 포함된 것만 키워드로 추출 (없는 키워드를 만들어내지 않음)
-SEARCH_KEYWORDS = [
-    "적합성", "설명의무", "투자권유", "일반투자자", "전문투자자",
-    "고령투자자", "파생상품", "ELS", "펀드", "내부통제",
-    "정보차단벽", "준법감시", "불건전영업", "손실", "원금",
-]
-
-
-def _extract_keywords(text: str) -> list[str]:
-    """본문에 실제로 등장하는 키워드만 추출한다."""
-    return [kw for kw in SEARCH_KEYWORDS if kw in text]
-
-
 def _clean_text(text: str) -> str:
     """검색 품질을 위해 과도한 공백과 빈 줄을 줄인다."""
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
@@ -166,9 +112,7 @@ def _make_parsed_chunk(
     case_no: Optional[str],
     url: str,
     text: str,
-    article_title: Optional[str] = None,
     section_no: Optional[str] = None,
-    section_title: Optional[str] = None,
 ) -> ParsedChunk:
     """원문 단위 1개를 citation-preserving chunk 1개로 변환한다."""
     doc_id = _make_doc_id(source_type, source_name, identifier)
@@ -179,13 +123,9 @@ def _make_parsed_chunk(
         source_name=source_name,
         citation_id=citation_id,
         article_no=article_no,
-        article_title=article_title,
         section_no=section_no,
-        section_title=section_title,
         case_no=case_no,
         url=url,
-        category=_classify_category(cleaned),
-        keywords=_extract_keywords(cleaned),
         text=cleaned,
         verified=False,
     )
@@ -324,7 +264,6 @@ def _parse_kofia_article_html(doc: RawDocument, soup: BeautifulSoup) -> list[Par
             identifier=article_no,   # doc_id·citation_id 키: "제5조"
             citation_id=article_no,
             article_no=article_no,
-            article_title=article_title,
             case_no=None,
             url=doc.url,
             text=text,
@@ -357,7 +296,6 @@ def _parse_kofia_section_html(doc: RawDocument, soup: BeautifulSoup) -> list[Par
             citation_id=section_no,
             article_no=None,
             section_no=section_no,
-            section_title=section_title,
             case_no=None,
             url=doc.url,
             text=text,
@@ -478,7 +416,6 @@ def _parse_drf_xml(doc: RawDocument) -> list[ParsedChunk]:
             identifier=article_no,
             citation_id=article_no,
             article_no=article_no,
-            article_title=title or None,
             case_no=None,
             url=doc.url,
             text=text,

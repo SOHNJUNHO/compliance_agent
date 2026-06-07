@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 PROMPT_DIR = Path("prompts")
 
 # Langfuse에 등록/조회할 프롬프트 이름 목록
-PROMPT_NAMES = ["synthesize_agent", "factcheck_agent", "classify_agent", "hyde_agent"]
+PROMPT_NAMES = ["synthesize_agent", "factcheck_agent", "classify_agent",
+                "hyde_regulation", "hyde_law", "hyde_case"]
 
 # 싱글턴 클라이언트 캐시
 _client = None
+
+# 프롬프트 동기화가 이 프로세스에서 이미 실행되었는지 여부 (프로세스당 1회 보장)
+_prompts_synced = False
 
 
 def get_client():
@@ -57,16 +61,22 @@ def get_client():
 
 def sync_prompts() -> None:
     """
-    Langfuse 프롬프트 레지스트리를 로컬 파일과 동기화한다.
+    Langfuse 프롬프트 레지스트리를 로컬 파일과 동기화한다 (프로세스당 1회).
 
     각 프롬프트 이름에 대해:
       1. Langfuse에서 get_prompt()로 조회
       2. 없으면(404 등) 로컬 prompts/*.txt 파일 내용으로 create_prompt() 호출
       3. 이미 존재하면 아무 것도 하지 않음 (기존 버전 보존)
 
-    호출 시점: main.py의 run_query() 시작 시 1회.
-    반복 호출해도 안전하다 (이미 존재하는 프롬프트는 skip).
+    이것은 배포/부트스트랩 성격의 작업이므로 요청 처리 경로가 아니라 프로세스
+    시작 시 1회만 실행해야 한다 (CLI: main(), 서비스: FastAPI lifespan startup).
+    모듈 전역 _prompts_synced 플래그로 멱등성(idempotency)을 보장하므로, 어디서
+    몇 번 호출하든 실제 동기화 작업은 프로세스당 한 번만 일어난다.
     """
+    global _prompts_synced
+    if _prompts_synced:
+        return
+
     client = get_client()
     for name in PROMPT_NAMES:
         try:
@@ -89,6 +99,10 @@ def sync_prompts() -> None:
                 logger.info(f"[langfuse] 프롬프트 등록 완료: {name}")
             except Exception as e:
                 logger.warning(f"[langfuse] 프롬프트 등록 실패: {name} ({e})")
+
+    # 성공/실패와 무관하게 1회 시도 후 플래그를 세운다. Langfuse 미연결 시에도
+    # get_langfuse_prompt()가 로컬 파일로 폴백하므로 매 요청마다 재시도할 필요가 없다.
+    _prompts_synced = True
 
 
 def get_langfuse_prompt(name: str) -> str:

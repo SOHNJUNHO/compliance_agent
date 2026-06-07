@@ -28,7 +28,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s"
 )
 
-from langfuse import observe, get_client
+from langfuse import observe, get_client, propagate_attributes
 from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
 LlamaIndexInstrumentor().instrument()
 
@@ -44,7 +44,8 @@ from llama_index.llms.ollama import Ollama
 LLM_INSTANCE = Ollama(
     model="qwen3:8b-q4_K_M",
     request_timeout=120.0,
-    json_mode=True,
+    json_mode=True,    # 출력을 유효한 JSON으로 강제
+    thinking=False,    # qwen3 추론(<think>) 출력 비활성화 → 응답이 순수 JSON이 됨
 )
 
 
@@ -53,76 +54,74 @@ LLM_INSTANCE = Ollama(
 # =============================================================================
 
 @observe(name="compliance_query", as_type="span")
-async def run_query(query: str) -> None:
+async def run_query(query: str, user_id: str = "anonymous") -> None:
     """컴플라이언스 질문을 워크플로우에 전달하고 결과를 출력한다."""
-    sys.path.insert(0, ".")
-    sys.path.insert(0, "data")
-    sys.path.insert(0, "workflow")
+    # sys.path.insert(0, ".")
+    # sys.path.insert(0, "data")
+    # sys.path.insert(0, "workflow")
 
-    from pathlib import Path
     from data.ingest import load_index
     from workflow.tools import tool_registry
     from workflow.compliance_workflow import ComplianceWorkflow
     from workflow.reranker import build_reranker
-    from langfuse_setup import sync_prompts
 
+    client = get_client()
     # Langfuse 루트 트레이스 입력 기록
-    get_client().update_current_span(input={"query": query})
+    client.update_current_span(input={"query": query})
 
-    # Langfuse 프롬프트 동기화 (없으면 로컬 파일에서 업로드)
-    sync_prompts()
+    # user_id를 이 trace의 모든 하위 span(LlamaIndex instrumentor가 async 워크플로우
+    # 내부에서 생성하는 span 포함)에 전파한다. OTEL baggage 기반이라 계측 경계를
+    # 넘어 유지된다. → Langfuse UI의 Users 필터가 trace 전체에 일관되게 적용된다.
+    with propagate_attributes(user_id=user_id):
+        # 프롬프트 동기화는 main()에서 프로세스 시작 시 1회 수행한다 (요청 경로 아님).
 
-    if not Path("data/article_lookup.json").exists():
-        print("오류: data/article_lookup.json 없음. python run_ingest.py를 먼저 실행하세요.")
-        sys.exit(1)
+        # load_index()가 Qdrant 컬렉션 부재/공백 시 명확한 오류를 발생시킨다.
+        # article_lookup 테이블도 동일 컬렉션에서 구성되므로 별도 파일 검사는 불필요.
+        index = load_index()
 
-    index = load_index()
+        # 재순위기 초기화 (USE_RERANKER=0 이면 None → 기존 동작 유지)
+        reranker = build_reranker()
+        tool_registry.build(index, reranker=reranker)
 
-    # 재순위기 초기화 (USE_RERANKER=0 이면 None → 기존 동작 유지)
-    reranker = build_reranker()
-    tool_registry.build(index, reranker=reranker)
-
-    wf = ComplianceWorkflow(
-        llm=LLM_INSTANCE,
-        registry=tool_registry,
-        timeout=300,
-        verbose=True,
-    )
-
-    print(f"\n{'='*50}")
-    print(f"질문: {query}")
-    print(f"{'='*50}")
-
-    handler = wf.run(query=query)
-    result = await handler
-
-    if hasattr(result, "verdict"):
-        print(f"\n[판정] {result.verdict}")
-        print(f"[근거] {result.reasoning}")
-        print(f"[인용 조항] {result.cited_articles}")
-        print(f"[위험도] {result.risk_level}/3")
-        print(f"[팩트체크] {'통과 ✓' if result.factcheck_passed else '실패 ✗'}")
-        print(f"[실행 에이전트] {result.agents_used}")
-        print(f"[총 토큰 사용량] {result.token_used}")
-
-        # Langfuse 루트 트레이스 출력 기록
-        get_client().update_current_span(
-            output={
-                "verdict": result.verdict,
-                "factcheck_passed": result.factcheck_passed,
-                "risk_level": result.risk_level,
-            },
-            metadata={
-                "agents_used": str(result.agents_used),
-                "token_used": str(result.token_used),
-            },
+        wf = ComplianceWorkflow(
+            llm=LLM_INSTANCE,
+            registry=tool_registry,
+            timeout=300,
+            verbose=True,
         )
-    else:
-        print(f"결과: {result}")
+
+        print(f"\n{'='*50}")
+        print(f"질문: {query}")
+        print(f"{'='*50}")
+
+        handler = wf.run(query=query)
+        result = await handler
+
+        if hasattr(result, "verdict"):
+            print(f"\n[판정] {result.verdict}")
+            print(f"[근거] {result.reasoning}")
+            print(f"[인용 조항] {result.cited_articles}")
+            print(f"[위험도] {result.risk_level}/3")
+            print(f"[팩트체크] {'통과 ✓' if result.factcheck_passed else '실패 ✗'}")
+            print(f"[실행 에이전트] {result.agents_used}")
+
+            # Langfuse 루트 트레이스 출력 기록
+            client.update_current_span(
+                output={
+                    "verdict": result.verdict,
+                    "factcheck_passed": result.factcheck_passed,
+                    "risk_level": result.risk_level,
+                },
+                metadata={
+                    "agents_used": str(result.agents_used),
+                },
+            )
+        else:
+            print(f"결과: {result}")
 
     # 프로세스 종료 전 Langfuse 이벤트 큐를 강제 전송
     # 스크립트/CLI 환경에서는 백그라운드 스레드가 종료 전에 flush를 보장하지 않으므로 필수
-    get_client().flush()
+    client.flush()
 
 
 # =============================================================================
@@ -132,23 +131,32 @@ async def run_query(query: str) -> None:
 def main():
     """
     사용법:
-      python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?"
+      python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?" [user_id]
+
+    user_id (선택, 기본 'anonymous'):
+      Langfuse trace에 부여되어 Users 필터/그룹화에 사용된다.
 
     데이터 적재 (최초 1회):
       python run_ingest.py [pdf_path ...]
     """
     if len(sys.argv) < 2 or sys.argv[1] != "query":
-        print("사용법: python main.py query '질문'")
+        print("사용법: python main.py query '질문' [user_id]")
         print("데이터 적재: python run_ingest.py [pdf_path ...]")
         sys.exit(1)
 
     if len(sys.argv) < 3:
         print("오류: 질문을 입력하세요.")
-        print("예: python main.py query '65세 고객에게 레버리지 ETF 권유 가능한가요?'")
+        print("예: python main.py query '65세 고객에게 레버리지 ETF 권유 가능한가요?' cust-001")
         sys.exit(1)
 
+    # 프롬프트 동기화(부트스트랩)는 요청 경로가 아니라 프로세스 시작 시 1회만 수행한다.
+    # sync_prompts()는 멱등이라 재호출해도 안전하다.
+    from workflow.langfuse_setup import sync_prompts
+    sync_prompts()
+
     query = sys.argv[2]
-    asyncio.run(run_query(query))
+    user_id = sys.argv[3] if len(sys.argv) > 3 else "anonymous"
+    asyncio.run(run_query(query, user_id))
 
 
 if __name__ == "__main__":

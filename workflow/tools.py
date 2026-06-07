@@ -7,7 +7,7 @@
 #   regulation_search : source_type="사규" 고정 벡터 검색
 #   law_search        : source_type="법규" 고정 벡터 검색
 #   case_search       : source_type="분쟁사례" 고정 벡터 검색
-#   article_lookup    : 표준 인용 ID exact match (JSON 파일 기반)
+#   article_lookup    : 표준 인용 ID exact match (Qdrant 페이로드 기반)
 #
 # 핵심 설계: source_type 필터 하드코딩
 #   각 검색 함수는 자신의 source_type 필터가 코드에 고정되어 있다.
@@ -15,10 +15,9 @@
 #   → regulation_search는 항상 사규만, law_search는 항상 법규만 반환
 # =============================================================================
 
-import json
+import asyncio
 import logging
-from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Optional
 
 from llama_index.core import VectorStoreIndex
@@ -33,15 +32,12 @@ from llama_index.core.vector_stores import (
 
 logger = logging.getLogger(__name__)
 
-# article_lookup.json 경로 (ingest.py에서 생성)
-LOOKUP_INDEX_PATH = Path("data/article_lookup.json")
-
 
 # =============================================================================
 # 벡터 검색 함수 팩토리
 # =============================================================================
 
-SearchFn = Callable[[str, str, str, str, str, str], list[dict]]
+SearchFn = Callable[..., Awaitable[list[dict]]]
 LookupFn = Callable[[str, str], Optional[dict]]
 
 
@@ -68,19 +64,17 @@ def _make_search_fn(
           "source_name": "표준투자권유준칙",
           "article_no":  "제5조",
           "case_no":     "",
-          "category":    "적합성원칙",
           "url":         "https://...",
           "score":       0.87          ← 코사인 유사도 점수 (재순위 후에도 원본 유지)
         },
         ...
       ]
     """
-    def search_fn(
+    async def search_fn(
         query: str,
         source_name: str = "",
         citation_id: str = "",
         case_no: str = "",
-        category: str = "",
         article_no: str = "",
     ) -> list[dict]:
         """
@@ -91,7 +85,6 @@ def _make_search_fn(
             source_name: 명시된 문서명 precision filter
             citation_id: 명시된 조항/섹션/사건번호 precision filter
             case_no: 명시된 사건번호 precision filter
-            category: 고신뢰 주제 precision filter
 
         Returns:
             관련 문서 청크 목록 (최대 top_k개, source_type 필터 적용)
@@ -108,7 +101,6 @@ def _make_search_fn(
             "citation_id": citation_id,
             "article_no": article_no,
             "case_no": case_no,
-            "category": category,
         }
         for key, value in optional_filters.items():
             if value:
@@ -123,13 +115,17 @@ def _make_search_fn(
             filters=MetadataFilters(filters=filter_items),
         )
 
-        # retriever.retrieve(): 쿼리를 임베딩하고 저장된 벡터와 유사도 비교
-        nodes = retriever.retrieve(query)
+        # aretrieve(): 쿼리를 임베딩하고 저장된 벡터와 유사도 비교 (비동기 — 이벤트
+        # 루프를 막지 않으므로 세 검색 레인이 실제로 겹쳐 실행된다)
+        nodes = await retriever.aretrieve(query)
 
         # ── 재순위 (reranker가 있을 때만 실행) ──────────────────────────────
         # cross-encoder가 (query, chunk) 쌍을 함께 보고 관련성 재평가 → 정밀도 향상
+        # postprocess_nodes는 동기 모델 추론이므로 to_thread로 루프 밖에서 실행한다.
         if reranker is not None and nodes:
-            nodes = reranker.postprocess_nodes(nodes, query_str=query)
+            nodes = await asyncio.to_thread(
+                reranker.postprocess_nodes, nodes, query_str=query
+            )
             # reranker.top_n=10으로 설정되어 있으므로 여기서 최종 개수로 절삭
             cutoff = final_top_n if final_top_n is not None else top_k
             nodes = nodes[:cutoff]
@@ -142,13 +138,9 @@ def _make_search_fn(
                 "source_name": node.metadata.get("source_name", ""),
                 "citation_id": node.metadata.get("citation_id", ""),
                 "article_no":  node.metadata.get("article_no", ""),
-                "article_title": node.metadata.get("article_title", ""),
                 "section_no": node.metadata.get("section_no", ""),
-                "section_title": node.metadata.get("section_title", ""),
                 "case_no":     node.metadata.get("case_no", ""),
-                "category":    node.metadata.get("category", ""),
                 "url":         node.metadata.get("url", ""),
-                "chunk_id":     node.metadata.get("chunk_id", node.node_id),
                 "verified":     node.metadata.get("verified", False),
                 # score: 코사인 유사도 (1.0에 가까울수록 관련성 높음)
                 "score":       round(node.score or 0.0, 4),
@@ -170,16 +162,17 @@ def _make_lookup_fn() -> LookupFn:
       synthesize_step이 인용한 조항이 실제로 존재하는지 검증하는 데 사용.
       벡터 유사도가 아닌 딕셔너리 키 조회 → 정확한 존재 여부 확인 가능.
 
-    JSON 파일 기반:
-      ingest.py의 build_lookup_index()가 생성한 article_lookup.json을 사용.
-      벡터 DB 없이 동작하므로 가볍고 빠름.
+    Qdrant 페이로드 기반:
+      별도 JSON 파일을 쓰지 않는다. 조항 원문·메타데이터는 이미 Qdrant 페이로드에
+      존재하므로 ingest.load_lookup_table()이 컬렉션을 1회 scroll하여 동일한
+      인메모리 딕셔너리를 구성한다. → 중복 저장(second source of truth) 제거.
 
     키 형식: "{source_name}||{citation_id}"
       예: "표준투자권유준칙||제5조", "금융투자회사표준내부통제기준||2.2.1"
 
     캐시: 첫 호출 시 1회 로드 후 클로저 변수에 보관한다.
-    factcheck/validate 단계에서 한 쿼리당 10~20회 호출되며,
-    파일 크기가 1MB+이므로 매 호출 디스크 I/O는 무시할 수 없는 비용이다.
+    factcheck/validate 단계에서 한 쿼리당 10~20회 호출되므로, 첫 호출에서만
+    scroll하고 이후에는 인메모리 조회로 처리한다.
     """
     cache: dict[str, dict] | None = None
 
@@ -192,11 +185,8 @@ def _make_lookup_fn() -> LookupFn:
         """
         nonlocal cache
         if cache is None:
-            if not LOOKUP_INDEX_PATH.exists():
-                logger.warning("article_lookup.json 없음 — ingest.py 먼저 실행 필요")
-                return None
-            with open(LOOKUP_INDEX_PATH, "r", encoding="utf-8") as f:
-                cache = json.load(f)
+            from data.ingest import load_lookup_table
+            cache = load_lookup_table()
 
         key = f"{source_name}||{citation_id}"
         result = cache.get(key)
@@ -275,7 +265,7 @@ class ToolRegistry:
             reranker=reranker,
             final_top_n=2,
         )
-        # exact match 조회 함수: 벡터 인덱스 불필요 (JSON 파일 기반)
+        # exact match 조회 함수: 벡터 인덱스 불필요 (Qdrant 페이로드 기반)
         self.article_lookup = _make_lookup_fn()
 
         mode = "재순위 활성화" if reranker else "벡터 검색만"
