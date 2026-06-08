@@ -64,13 +64,13 @@ LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 ```
 
-`QDRANT_COLLECTION` defaults to `compliance_agents`. `LANGFUSE_BASE_URL` defaults to `https://cloud.langfuse.com`. You only need to set these if you use a different collection name or a self-hosted Langfuse instance.
+`QDRANT_COLLECTION` defaults to `compliance_agent`. `LANGFUSE_BASE_URL` defaults to `https://cloud.langfuse.com`. You only need to set these if you use a different collection name or a self-hosted Langfuse instance.
 
 ---
 
 ## Step 4 — Ingest data
 
-This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. Also writes `data/article_lookup.json` for exact-match validation.
+This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. The exact-match lookup table is built from Qdrant at query time — no separate file is written.
 
 ```bash
 python run_ingest.py
@@ -83,7 +83,7 @@ INFO scraper: [raw] 로컬 RawDocument 8개 로드
 === 2. 파싱 ===
 INFO parser: 총 850개 청크 파싱 완료
 === 3. 적재 ===
-INFO ingest: Qdrant 사용: https://...qdrant.tech / collection=compliance_agents
+INFO ingest: Qdrant 사용: https://...qdrant.tech / collection=compliance_agent
 INFO ingest: VectorStoreIndex 구성 완료
 완료: 850개 청크 적재됨
 ```
@@ -100,9 +100,16 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 
 Expected output shape:
 ```
-[답변] 조건부 가능합니다. 표준투자권유준칙 제14조에 따라 고령투자자에게는 별도의 적합성 확인 절차가 필요합니다...
-[인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
+[답변]
+표준투자권유준칙||제14조
+  → 고령투자자(65세 이상)에게는 별도의 적합성 확인 절차가 필요합니다.
+[사용된 근거 ID] ['표준투자권유준칙||제14조', ...]
 [실행 에이전트] ['규정', '법규']
+[활성화 근거] 고령투자자 투자권유는 사규의 적합성원칙과 법적 의무 모두 관련됩니다.
+
+[인용 근거]
+표준투자권유준칙||제14조
+  "제14조(고령투자자 보호) 회사는 65세 이상 ..."
 ```
 
 > **Note**: `query` mode loads the existing Qdrant collection — no re-embedding.
@@ -161,7 +168,7 @@ python run_ingest.py ./분쟁사례.pdf
 | `Langfuse` warnings in logs | Langfuse not configured | Set `LANGFUSE_*` env vars in `.env`, or ignore (workflow still runs) |
 | `사용자 정보 검증에 실패하였습니다` | DRF API key invalid | Only matters for re-scraping; local `data/raw/` files are used by default |
 | Empty search results | Qdrant collection empty | Run `python run_ingest.py` first |
-| Slow first query | Embedding 850 chunks | Expected — subsequent queries are faster |
+| Slow first query | Reranker model load from HuggingFace (~2.2 GB, one-time) | Expected — cached after first run; set `USE_RERANKER=0` to skip |
 
 ---
 
@@ -171,11 +178,14 @@ python run_ingest.py ./분쟁사례.pdf
 |---|---|---|
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Ollama embedding model name |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant server URL |
-| `QDRANT_COLLECTION` | `compliance_agents` | Qdrant collection name |
+| `QDRANT_COLLECTION` | `compliance_agent` | Qdrant collection name |
 | `QDRANT_API_KEY` | *(empty)* | Qdrant Cloud API key (empty = local, no auth) |
+| `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
+| `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
+| `USE_RERANKER` | `1` | Set to `0` to skip cross-encoder reranking |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace reranker model (~2.2 GB, auto-downloaded) |
 | `LANGFUSE_PUBLIC_KEY` | *(none)* | Langfuse public key |
 | `LANGFUSE_SECRET_KEY` | *(none)* | Langfuse secret key |
 | `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse server URL (use `https://us.cloud.langfuse.com` for US region) |
-| `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
-| `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
+| `LANGFUSE_SYNC_PROMPTS` | *(unset)* | Set to `1` to trigger create-if-missing prompt sync on boot |
 | `DRF_OC` | *(empty)* | law.go.kr open-API key — only needed to re-scrape `법규`/판례 (cached `data/raw/` covers normal runs) |

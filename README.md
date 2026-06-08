@@ -55,10 +55,9 @@ LLM이 유효한 레인을 반환하지 못하면 세 레인을 모두 활성화
 scraper.py    →  RawDocument         (HTML / XML / PDF 원본)
 parser.py     →  ParsedChunk          (citation 1개 = 청크 1개, source-aware)
 ingest.py     →  Qdrant VectorStoreIndex   (벡터 검색용)
-              →  data/article_lookup.json  (citation_id exact-match 인덱스, 검색 단계 검증용)
 ```
 
-`article_lookup.json`은 850개 항목을 `source_name||citation_id` 키로 보관합니다. 벡터 검색은 "비슷한" 문서를 찾고, lookup은 "정확히 존재하는지"를 확인합니다. 두 인덱스는 역할이 분리되어 있습니다.
+별도의 `article_lookup.json` 파일은 없습니다. query 시작 시 `load_lookup_table()`이 Qdrant 컬렉션을 1회 scroll하여 `source_name||citation_id → 조항 dict` 인메모리 테이블을 구성합니다. 벡터 검색은 "비슷한" 문서를 찾고, lookup은 "정확히 존재하는지"를 확인합니다. 두 조회는 역할이 분리되어 있습니다.
 
 Ingest와 query는 완전히 분리되어 있습니다. `ingest`는 한 번만 실행하고 (`USE_QDRANT=1`이면 Qdrant Cloud에 영속), `query`는 기존 컬렉션을 재임베딩 없이 로드합니다.
 
@@ -102,11 +101,18 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 ## 출력 예시
 
 ```
-[답변] 조건부 가능합니다. 표준투자권유준칙 제14조에 따라 고령투자자(65세 이상)에게는
-       별도의 적합성 확인 절차가 필요합니다. 레버리지 ETF는 고위험 상품으로, 위험 감수
-       능력 확인 및 충분한 설명의무 이행이 선행되어야 합니다.
-[인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
+[답변]
+표준투자권유준칙||제14조
+  → 고령투자자(65세 이상)에게는 별도의 적합성 확인 절차가 필요합니다.
+자본시장과금융투자업에관한법률||제46조
+  → 적합성 원칙에 따라 투자자 성향을 먼저 확인해야 합니다.
+[사용된 근거 ID] ['표준투자권유준칙||제14조', '자본시장과금융투자업에관한법률||제46조']
 [실행 에이전트] ['규정', '법규']
+[활성화 근거] 고령투자자 투자권유는 사규의 적합성원칙과 법적 의무 모두 관련됩니다.
+
+[인용 근거]
+표준투자권유준칙||제14조
+  "제14조(고령투자자 보호) 회사는 65세 이상 ..."
 ```
 
 ---
@@ -118,7 +124,7 @@ main.py                   # 진입점 (query 전용; 데이터 적재는 run_ing
 data/
   scraper.py              # 로컬 raw 우선, 없으면 웹 fallback → RawDocument
   parser.py               # RawDocument → ParsedChunk (source-aware citation 단위)
-  ingest.py               # ParsedChunk → Qdrant + article_lookup.json
+  ingest.py               # ParsedChunk → Qdrant (lookup 테이블은 query 시 scroll로 구성)
   raw/                    # 수집된 HTML/XML 캐시 (재현성)
   raw/prec/               # 판례 XML
 workflow/
@@ -126,13 +132,14 @@ workflow/
   tools.py                # 4개 검색/조회 함수 + ToolRegistry
   evidence.py             # 근거 추출·검증·포맷 순수 함수
   compliance_workflow.py  # 5-Step Workflow 본문
-  reranker.py             # Qwen3-Reranker cross-encoder (USE_RERANKER=0 비활성화)
+  reranker.py             # BAAI/bge-reranker-v2-m3 cross-encoder (USE_RERANKER=0 비활성화)
   langfuse_setup.py       # Langfuse 클라이언트 + 프롬프트 관리
-  user_memory.py          # 사용자 프로필·이력 SQLite 영속화 (현재 main.py 미연결 — PoC 범위 외)
 prompts/
   classify_agent.txt      # 레인 라우팅
-  hyde_agent.txt          # 쿼리 → 가상 법령 조항 변환
-  synthesize_agent.txt    # 합성 LLM 시스템 프롬프트
+  hyde_regulation.txt     # 쿼리 → 가상 사규 조항 변환 (HyDE)
+  hyde_law.txt            # 쿼리 → 가상 법령 조항 변환 (HyDE)
+  hyde_case.txt           # 쿼리 → 가상 판례 판시사항 변환 (HyDE)
+  synthesize_agent.txt    # per-passage 합성 LLM 시스템 프롬프트
 ```
 
 **의존 방향**: `scraper → parser → ingest → tools → compliance_workflow → main`
@@ -143,27 +150,24 @@ prompts/
 
 - **LLM**: Ollama `qwen3:8b-q4_K_M` (json_mode=True)
 - **Embedding**: Ollama `qwen3-embedding:0.6b-q8_0` (1024-dim)
-- **Vector DB**: Qdrant Cloud, INT8 scalar quantization, payload index 6개 필드
-- **Reranker**: `Qwen/Qwen3-Reranker-0.6B` cross-encoder (도메인 instruction 자동 prefix)
-- **Query transform**: HyDE — 질문을 가상 법령 조항으로 변환 후 임베딩 (Gao et al. 2022)
+- **Vector DB**: Qdrant Cloud, TurboQuantization BITS4 (always_ram=True), payload index 5개 필드
+- **Reranker**: `BAAI/bge-reranker-v2-m3` cross-encoder (HuggingFace 자동 다운로드 ~2.2 GB)
+- **Query transform**: HyDE — 질문을 레인별 코퍼스 문체의 가상 문서로 변환 후 임베딩 (Gao et al. 2022)
 - **Routing**: `classify_agent.txt` — LLM이 의미 기반으로 레인 활성화 결정
-- **검증(Validation)**: `article_lookup.json` exact-match dictionary로 검색 단계에서 citation_id 존재를 확인 (캐시 1회 로드)
-- **Observability**: Langfuse — `@observe` 수동 계측으로 5개 비즈니스 스팬(루트 + classify + search×3 + synthesize)을 기록한다. LLM/embedding 자동 트레이싱은 비활성화되어 있다. Langfuse 미설정 시 모든 호출이 no-op fallback이 되어 워크플로우 실행에는 영향 없다.
+- **검증(Validation)**: Qdrant scroll 기반 인메모리 테이블 (`source_name||citation_id → dict`)로 검색 단계에서 citation_id 존재를 확인 (query 시작 시 1회 로드)
+- **Observability**: Langfuse — `@observe` 수동 계측으로 6개 스팬(루트 compliance_query + classify + search×3 + synthesize)을 기록한다. LlamaIndex 자동 트레이싱도 활성화되어 있어 raw LLM/embedding 스팬이 추가로 기록된다. Langfuse 미설정 시 모든 호출이 no-op fallback이 되어 워크플로우 실행에는 영향 없다.
 
 각 청크는 본문 `text`를 임베딩하고 다음 metadata를 저장합니다.
 
 | 필드 | 목적 |
 |---|---|
-| `source_type` | 필수 lane filter (`사규`, `법규`, `분쟁사례`) |
-| `source_name` | 특정 규정집/법령 precision filter |
+| `source_type` | lane filter (`사규`, `법규`, `분쟁사례`) — tools.py에 하드코딩 |
+| `source_name` | 규정집/법령 이름 — 답변 인용 표시에 사용 |
 | `citation_id` | exact-match 검증의 표준 키 (`제48조`, `2.2.1`, 사건번호) |
-| `article_no` / `article_title` | 조항형 문서 |
-| `section_no` / `section_title` | 섹션형 문서 |
-| `case_no` | 판례 인용 |
-| `category` | 카테고리 분류 (검색 결과 부가 정보 — precision filter 미적용) |
-| `url` | 원문 출처 |
-
-검색은 항상 `source_type` filter를 적용한 뒤 semantic search를 수행하고, 질문에 명시적 문서명·조항번호가 있으면 `source_name`·`citation_id` precision filter를 추가합니다.
+| `article_no` | 조항번호 (조항형 문서 전용) |
+| `section_no` | 섹션번호 (섹션형 문서 전용) |
+| `case_no` | 사건번호 (분쟁사례 전용) |
+| `url` | 원문 출처 (워크플로우 미사용) |
 
 ---
 

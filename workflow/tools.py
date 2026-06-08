@@ -70,21 +70,12 @@ def _make_search_fn(
         ...
       ]
     """
-    async def search_fn(
-        query: str,
-        source_name: str = "",
-        citation_id: str = "",
-        case_no: str = "",
-        article_no: str = "",
-    ) -> list[dict]:
+    async def search_fn(query: str) -> list[dict]:
         """
         쿼리 텍스트로 관련 문서를 검색한다.
 
         Args:
             query: 검색할 질문 또는 키워드
-            source_name: 명시된 문서명 precision filter
-            citation_id: 명시된 조항/섹션/사건번호 precision filter
-            case_no: 명시된 사건번호 precision filter
 
         Returns:
             관련 문서 청크 목록 (최대 top_k개, source_type 필터 적용)
@@ -96,19 +87,6 @@ def _make_search_fn(
                 operator=FilterOperator.EQ,
             )
         ]
-        optional_filters = {
-            "source_name": source_name,
-            "citation_id": citation_id,
-            "article_no": article_no,
-            "case_no": case_no,
-        }
-        for key, value in optional_filters.items():
-            if value:
-                filter_items.append(MetadataFilter(
-                    key=key,
-                    value=value,
-                    operator=FilterOperator.EQ,
-                ))
 
         retriever = index.as_retriever(
             similarity_top_k=top_k,
@@ -140,8 +118,6 @@ def _make_search_fn(
                 "article_no":  node.metadata.get("article_no", ""),
                 "section_no": node.metadata.get("section_no", ""),
                 "case_no":     node.metadata.get("case_no", ""),
-                "url":         node.metadata.get("url", ""),
-                "verified":     node.metadata.get("verified", False),
                 # score: 코사인 유사도 (1.0에 가까울수록 관련성 높음)
                 "score":       round(node.score or 0.0, 4),
             })
@@ -158,8 +134,8 @@ def _make_lookup_fn() -> LookupFn:
     """
     표준 인용 ID + 출처명으로 원문을 exact match 조회하는 함수.
 
-    factcheck_step 전용:
-      synthesize_step이 인용한 조항이 실제로 존재하는지 검증하는 데 사용.
+    validate_article_evidence 전용:
+      검색 결과의 조항이 실제로 Qdrant 페이로드에 존재하는지 검증하는 데 사용.
       벡터 유사도가 아닌 딕셔너리 키 조회 → 정확한 존재 여부 확인 가능.
 
     Qdrant 페이로드 기반:
@@ -171,7 +147,7 @@ def _make_lookup_fn() -> LookupFn:
       예: "표준투자권유준칙||제5조", "금융투자회사표준내부통제기준||2.2.1"
 
     캐시: 첫 호출 시 1회 로드 후 클로저 변수에 보관한다.
-    factcheck/validate 단계에서 한 쿼리당 10~20회 호출되므로, 첫 호출에서만
+    validate_article_evidence 단계에서 한 쿼리당 10~20회 호출되므로, 첫 호출에서만
     scroll하고 이후에는 인메모리 조회로 처리한다.
     """
     cache: dict[str, dict] | None = None
@@ -191,7 +167,7 @@ def _make_lookup_fn() -> LookupFn:
         key = f"{source_name}||{citation_id}"
         result = cache.get(key)
         if not result:
-            logger.warning(f"조항 미존재: {key}")  # factcheck 실패 원인 추적용
+            logger.warning(f"조항 미존재: {key}")
         return result
 
     return lookup_fn

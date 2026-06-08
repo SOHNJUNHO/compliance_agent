@@ -8,13 +8,13 @@
 #   scraper.py → parser.py → [ingest.py] → Vector DB
 #
 # VectorStoreIndex 하나를 생성한다 (벡터 유사도 검색용, tools.py의 search 툴들이 사용).
-# factcheck_step의 exact-match 조회 테이블(article_lookup)은 별도 파일로 저장하지 않고
-# query 시 load_lookup_table()이 Qdrant 페이로드에서 직접 구성한다 — 중복 저장 제거.
+# validate_article_evidence(evidence.py)의 exact-match 조회 테이블(article_lookup)은
+# 별도 파일로 저장하지 않고 query 시 load_lookup_table()이 Qdrant 페이로드에서 직접 구성한다 — 중복 저장 제거.
 #
 # 교체 지점:
 #   EMBEDDING_MODEL: Ollama 임베딩 모델 (기본 qwen3-embedding:0.6b)
 #   QDRANT_URL:      Qdrant 서버 주소 (기본 http://localhost:6333)
-#   QDRANT_COLLECTION: Qdrant 컬렉션명 (기본 compliance_agents)
+#   QDRANT_COLLECTION: Qdrant 컬렉션명 (기본 compliance_agent)
 #   USE_QDRANT:      Qdrant 사용 여부 (0이면 인메모리 VectorStore 사용)
 # =============================================================================
 
@@ -200,10 +200,10 @@ def build_vector_index(chunks: list[ParsedChunk]) -> VectorStoreIndex:
 
 def load_lookup_table() -> dict[str, dict]:
     """
-    factcheck_step 전용 exact-match 조회 테이블을 Qdrant에서 직접 구성한다.
+    validate_article_evidence(evidence.py) 전용 exact-match 조회 테이블을 Qdrant에서 직접 구성한다.
 
     왜 exact-match 테이블이 필요한가:
-      factcheck_step은 "표준투자권유준칙 제5조가 실제로 존재하는가"를
+      validate_article_evidence는 "표준투자권유준칙 제5조가 실제로 존재하는가"를
       확인해야 한다. 벡터 유사도 검색은 "비슷한" 문서를 찾는 것이므로
       존재 여부 확인에 적합하지 않다.
       → 키-값 딕셔너리로 O(1) exact match 조회
