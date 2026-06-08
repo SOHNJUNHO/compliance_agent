@@ -16,7 +16,6 @@
 #   evidence_article_labels    — evidence → "문서명 조항" 라벨 목록
 #   format_synthesis_input     — 3개 레인 결과를 synthesize LLM 입력으로 포맷
 #   format_evidence_for_synthesis — 단일 evidence 목록을 LLM 입력으로 포맷
-#   format_factcheck_input     — factcheck LLM 입력(인용 조항 + 조회 결과) 포맷
 # =============================================================================
 
 import re
@@ -169,24 +168,3 @@ def format_evidence_for_synthesis(evidence: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def format_factcheck_input(verdict: str, reasoning: str, lookups: list[dict]) -> str:
-    """
-    factcheck LLM에게 전달할 컨텍스트를 포맷한다.
-    인용 조항 목록과 조회 결과(존재/미존재)를 포함한다.
-
-    lookups의 각 항목: {"cited": CitedArticle, "found": ..., "exists": bool}
-    """
-    lines = [
-        f"판정 초안: {verdict}",
-        f"근거: {reasoning}",
-        "",
-        "인용 조항 검증 결과:",
-    ]
-    for item in lookups:
-        status = "✓ 존재" if item["exists"] else "✗ 미존재"
-        cited = item["cited"]
-        eid = f"{cited.source_name}||{cited.citation_id}"
-        lines.append(
-            f"  - eid={eid} : {status}"
-        )
-    return "\n".join(lines)

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 PROMPT_DIR = Path("prompts")
 
 # Langfuse에 등록/조회할 프롬프트 이름 목록
-PROMPT_NAMES = ["synthesize_agent", "factcheck_agent", "classify_agent",
+PROMPT_NAMES = ["synthesize_agent", "classify_agent",
                 "hyde_regulation", "hyde_law", "hyde_case"]
 
 # 싱글턴 클라이언트 캐시
@@ -116,7 +116,7 @@ def get_langfuse_prompt(name: str) -> str:
       → 로컬 파일도 없으면 FileNotFoundError 발생.
 
     Args:
-        name: 프롬프트 이름 (예: "synthesize_agent", "factcheck_agent")
+        name: 프롬프트 이름 (예: "synthesize_agent", "classify_agent")
 
     Returns:
         프롬프트 텍스트 문자열

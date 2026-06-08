@@ -1,6 +1,6 @@
 # compliance-agents
 
-증권사 임직원이 컴플라이언스 질문을 입력하면, 사규·법규·분쟁사례를 검색하여 판정(가능 / 불가 / 조건부 가능), 인용 조항, 팩트체크 결과를 구조화된 형태로 반환하는 멀티에이전트 시스템입니다.
+증권사 임직원이 컴플라이언스 질문을 입력하면, 사규·법규·분쟁사례를 검색하여 근거 기반 답변과 인용 조항을 구조화된 형태로 반환하는 멀티에이전트 시스템입니다. 허용 여부("~ 가능한가?")뿐 아니라 규정·법규·판례를 묻는 정보성 질문에도 답합니다.
 
 증권사 AI 에이전트 개발자 포지션 지원용 포트폴리오 프로젝트이며, 성능 최적화보다 **설계 의도의 명확성**을 우선합니다. 자세한 셋업 방법은 [SETUP.md](SETUP.md)를 참조하세요.
 
@@ -14,11 +14,10 @@ StartEvent(query)
   ├─ [Step 2a] search_규정        HyDE → 사규 벡터 검색 → citation_id exact-match 검증
   ├─ [Step 2b] search_법규        HyDE → 법규 벡터 검색 → citation_id exact-match 검증   ← 병렬 fan-out
   ├─ [Step 2c] search_사례        HyDE → 분쟁사례 벡터 검색 → 사건번호 metadata 검증
-  ├─ [Step 3]  synthesize_step    검증된 근거만 합성 → 판정 JSON
-  └─ [Step 4]  factcheck_step     인용 citation_id 존재 여부 재검증 → StopEvent(FinalAnswer)
+  └─ [Step 3]  synthesize_step    검증된 근거만 합성 → 근거 기반 답변 JSON → StopEvent(FinalAnswer)
 ```
 
-LlamaIndex `Workflow`의 `@step` 어노테이션 타입이 곧 라우팅 규칙입니다. 검색 step은 LLM 요약을 만들지 않고 검증된 근거 객체만 반환하며, 최종 LLM은 검증된 원문 snippet과 metadata만 보고 판정합니다.
+LlamaIndex `Workflow`의 `@step` 어노테이션 타입이 곧 라우팅 규칙입니다. 검색 step은 LLM 요약을 만들지 않고 검증된 근거 객체만 반환하며, 최종 LLM은 검증된 원문 snippet과 metadata만 보고 답변합니다.
 
 ### Rule-based ↔ LLM 권한 분리
 
@@ -56,7 +55,7 @@ LLM이 유효한 레인을 반환하지 못하면 세 레인을 모두 활성화
 scraper.py    →  RawDocument         (HTML / XML / PDF 원본)
 parser.py     →  ParsedChunk          (citation 1개 = 청크 1개, source-aware)
 ingest.py     →  Qdrant VectorStoreIndex   (벡터 검색용)
-              →  data/article_lookup.json  (citation_id exact-match 인덱스, factcheck 전용)
+              →  data/article_lookup.json  (citation_id exact-match 인덱스, 검색 단계 검증용)
 ```
 
 `article_lookup.json`은 850개 항목을 `source_name||citation_id` 키로 보관합니다. 벡터 검색은 "비슷한" 문서를 찾고, lookup은 "정확히 존재하는지"를 확인합니다. 두 인덱스는 역할이 분리되어 있습니다.
@@ -93,7 +92,7 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 | 단계 | 소요 시간 |
 |------|---------|
 | `ingest` (850청크 임베딩 + Qdrant 업로드) | ~4–6분 |
-| `query` (HyDE 3회 + 검색 + reranker + 합성 + 팩트체크) | ~2분 |
+| `query` (HyDE 3회 + 검색 + reranker + 합성) | ~2분 |
 | Reranker 첫 로드 (HuggingFace 다운로드) | +1회 ~1.5GB |
 
 병렬로 표시되는 Step 2a/b/c는 실제로는 Ollama가 요청을 직렬 처리하므로 wall-clock은 직렬에 가깝습니다.
@@ -103,12 +102,10 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 ## 출력 예시
 
 ```
-[판정] 조건부 가능
-[근거] 표준투자권유준칙 제14조에 따라 고령투자자(65세 이상)에게는 별도의 적합성 확인
-       절차가 필요합니다. 레버리지 ETF는 고위험 상품으로, 위험 감수 능력 확인 및
-       충분한 설명의무 이행이 선행되어야 합니다.
+[답변] 조건부 가능합니다. 표준투자권유준칙 제14조에 따라 고령투자자(65세 이상)에게는
+       별도의 적합성 확인 절차가 필요합니다. 레버리지 ETF는 고위험 상품으로, 위험 감수
+       능력 확인 및 충분한 설명의무 이행이 선행되어야 합니다.
 [인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
-[팩트체크] 통과 ✓
 [실행 에이전트] ['규정', '법규']
 ```
 
@@ -136,7 +133,6 @@ prompts/
   classify_agent.txt      # 레인 라우팅
   hyde_agent.txt          # 쿼리 → 가상 법령 조항 변환
   synthesize_agent.txt    # 합성 LLM 시스템 프롬프트
-  factcheck_agent.txt     # 팩트체크 LLM 시스템 프롬프트
 ```
 
 **의존 방향**: `scraper → parser → ingest → tools → compliance_workflow → main`
@@ -151,8 +147,8 @@ prompts/
 - **Reranker**: `Qwen/Qwen3-Reranker-0.6B` cross-encoder (도메인 instruction 자동 prefix)
 - **Query transform**: HyDE — 질문을 가상 법령 조항으로 변환 후 임베딩 (Gao et al. 2022)
 - **Routing**: `classify_agent.txt` — LLM이 의미 기반으로 레인 활성화 결정
-- **Factcheck**: `article_lookup.json` exact-match dictionary (캐시 1회 로드)
-- **Observability**: Langfuse — `@observe` 수동 계측으로 6개 비즈니스 스팬(루트 + classify + search×3 + synthesize + factcheck)을 기록한다. LLM/embedding 자동 트레이싱은 비활성화되어 있다. Langfuse 미설정 시 모든 호출이 no-op fallback이 되어 워크플로우 실행에는 영향 없다.
+- **검증(Validation)**: `article_lookup.json` exact-match dictionary로 검색 단계에서 citation_id 존재를 확인 (캐시 1회 로드)
+- **Observability**: Langfuse — `@observe` 수동 계측으로 5개 비즈니스 스팬(루트 + classify + search×3 + synthesize)을 기록한다. LLM/embedding 자동 트레이싱은 비활성화되어 있다. Langfuse 미설정 시 모든 호출이 no-op fallback이 되어 워크플로우 실행에는 영향 없다.
 
 각 청크는 본문 `text`를 임베딩하고 다음 metadata를 저장합니다.
 

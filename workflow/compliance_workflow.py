@@ -10,13 +10,13 @@
 #   - async/await 기반이므로 Step 2a/b/c는 실제로 동시에 실행된다.
 #     (단, Ollama는 직렬 처리이므로 실질적 병렬 실행은 아님 — README 참조)
 #
-# 5개 Step:
+# 4개 Step:
 #   Step 1: classify_step   — LLM 기반 라우팅 (constrained JSON output)
 #   Step 2a: search_규정    — 사규 검색 + 조항 exact-match 검증
 #   Step 2b: search_법규    — 법규 검색 + 조항 exact-match 검증
 #   Step 2c: search_사례    — 분쟁사례 검색 + 사건번호 metadata 검증
-#   Step 3: synthesize_step — LLM 합성 (3개 결과 수집 후 실행)
-#   Step 4: factcheck_step  — 조항 exact-match 재검증 + LLM 존재 여부 판정
+#   Step 3: synthesize_step — LLM 합성 (3개 결과 수집 후 실행) → StopEvent 직접 반환
+#   (Step 4: factcheck_step — 비활성화: evidence-ID 간접참조가 동일 보장을 제공함)
 #
 # 검색 Step 구조:
 #   - 코드가 lane별 검색 함수를 직접 호출한다.
@@ -52,16 +52,13 @@ from llama_index.core.llms import LLM  # LLM 기반 클래스 (타입 힌트용)
 from llama_index.core.prompts import PromptTemplate  # 구조화 출력(structured_predict) 호출용
 
 from .events import (
-    CitedArticle,
     ClassifiedEvent,
     RegulationResultEvent,
     LawResultEvent,
     CaseResultEvent,
-    SynthesizedEvent,
     FinalAnswer,
     SynthesisResponse,   # LLM 구조화 출력 스키마
     ClassifyResponse,
-    FactcheckResponse,
 )
 from .tools import ToolRegistry
 from .evidence import (
@@ -70,17 +67,9 @@ from .evidence import (
     validate_case_evidence,
     evidence_article_labels,
     format_synthesis_input,
-    format_factcheck_input,
 )
 logger = logging.getLogger(__name__)
 
-# factcheck_step이 SynthesizedEvent를 재emit하는 최대 횟수.
-# 이 값을 초과하면 partial 결과로 강제 종료 (무한 루프 방지).
-MAX_FACTCHECK_RETRY = 1
-
-# astructured_predict는 PromptTemplate에 .format()을 적용한다. 프롬프트 본문의
-# 리터럴 중괄호({ }, 예: 출력 형식 예시)가 재해석되지 않도록 전체 프롬프트를 단일
-# 치환 슬롯으로 통째로 전달한다 — 치환되는 값 안의 중괄호는 str.format이 다시 해석하지 않는다.
 _PASSTHROUGH_PROMPT = PromptTemplate("{__prompt__}")
 
 
@@ -126,7 +115,7 @@ def load_prompt(name: str) -> str:
       코드 변경 없이 프롬프트 A/B 테스트 및 버전 롤백이 가능하다.
 
     Args:
-        name: 프롬프트 이름 (예: "synthesize_agent", "factcheck_agent")
+        name: 프롬프트 이름 (예: "synthesize_agent", "classify_agent")
 
     Returns:
         프롬프트 텍스트 문자열
@@ -261,13 +250,26 @@ class ComplianceWorkflow(Workflow):
           이 Step이 항상 첫 번째로 실행되므로 초기화 위치로 적합하다.
         """
         query: str = ev.get("query", "")
+        broaden: bool = bool(ev.get("broaden", False))
 
         # Langfuse: Step 입력 기록
-        get_client().update_current_span(input={"query": query})
+        get_client().update_current_span(input={"query": query, "broaden": broaden})
 
         # ctx 초기값 설정 (이후 Step들이 읽고 업데이트함)
-        await ctx.store.set("retry_count", 0)    # factcheck 재시도 카운터
         await ctx.store.set("agents_used", [])   # 실제 실행된 에이전트 기록
+        await ctx.store.set("broaden", broaden)  # 최광역 재시도 여부 → _search_lane이 읽음
+
+        # ── 최광역 재시도(broaden): 분류 LLM 생략, 전체 레인 강제 ─────────────
+        # 1차 검색이 근거 0건이라 main.py가 재호출한 경우다. precision filter는
+        # _search_lane이 broaden 플래그를 보고 해제한다. 라우팅까지 LLM에 맡길
+        # 이유가 없으므로(어차피 전체 레인을 열 것) 분류 호출을 생략한다.
+        if broaden:
+            agent_list = ["규정", "법규", "사례"]
+            logger.info("[classify] broaden 모드 → 분류 LLM 생략, 전체 레인 활성화")
+            get_client().update_current_span(
+                output={"agent_list": agent_list, "routing_reasoning": "[broaden: 전체 레인 강제]"}
+            )
+            return ClassifiedEvent(query=query, agent_list=agent_list)
 
         # ── LLM 라우팅 (구조화 출력) ──────────────────────────────────────────
         # ClassifyResponse 스키마를 Ollama format= 으로 강제 → agents가 허용 3종으로
@@ -342,11 +344,11 @@ class ComplianceWorkflow(Workflow):
         if lane.is_case:
             return lane.event_cls(
                 query=query, case_nos=[], summary=summary,
-                confidence=0.0, evidence=[], skipped=True,
+                evidence=[], skipped=True,
             )
         return lane.event_cls(
             query=query, articles=[], summary=summary,
-            confidence=0.0, evidence=[], skipped=True,
+            evidence=[], skipped=True,
         )
 
     async def _search_lane(
@@ -369,7 +371,9 @@ class ComplianceWorkflow(Workflow):
 
         # ── 검색 실행 (Rule-based, LLM 없음) ───────────────────────────────
         try:
-            filters = precision_filters(ev.query, lane.name)
+            # broaden(최광역 재시도) 모드면 precision filter를 해제해 source_type만 남긴다.
+            broaden = await ctx.store.get("broaden", False)
+            filters = {} if broaden else precision_filters(ev.query, lane.name)
             # HyDE: 원본 쿼리를 가상 법령 조항으로 변환해 임베딩 정렬을 개선한다.
             # (precision_filters는 원본 쿼리 기준으로 추출 — 명시된 조항번호·문서명 regex)
             hyde_query = await self._hyde_transform(ev.query, lane.hyde_prompt)
@@ -403,7 +407,6 @@ class ComplianceWorkflow(Workflow):
         await ctx.store.set("agents_used", agents_used + [lane.name])
 
         summary = f"검증된 {lane.summary_label} 근거 {len(evidence)}개"
-        confidence = 1.0 if evidence else 0.0
 
         # ── 결과 이벤트 구성 (타입별 필드 분기) ────────────────────────────
         if lane.is_case:
@@ -413,7 +416,7 @@ class ComplianceWorkflow(Workflow):
             )
             return lane.event_cls(
                 query=ev.query, case_nos=case_nos, summary=summary,
-                confidence=confidence, evidence=evidence,
+                evidence=evidence,
             )
 
         labels = evidence_article_labels(evidence)
@@ -422,14 +425,14 @@ class ComplianceWorkflow(Workflow):
         )
         return lane.event_cls(
             query=ev.query, articles=labels, summary=summary,
-            confidence=confidence, evidence=evidence,
+            evidence=evidence,
         )
 
     # =========================================================================
     # Step 3: synthesize_step
     # -------------------------------------------------------------------------
     # 입력: RegulationResultEvent | LawResultEvent | CaseResultEvent (3개 모두)
-    # 출력: SynthesizedEvent
+    # 출력: StopEvent(result=FinalAnswer) → 워크플로우 종료
     # LLM: 1회 호출
     # 특이사항: collect_events()로 3개 이벤트가 모두 도착할 때까지 대기
     # =========================================================================
@@ -442,9 +445,9 @@ class ComplianceWorkflow(Workflow):
         # 유니온 타입: 세 이벤트 중 어느 것이든 이 Step을 트리거할 수 있음
         # LlamaIndex가 세 타입을 모두 처리하는 Step으로 자동 인식
         ev: RegulationResultEvent | LawResultEvent | CaseResultEvent,
-    ) -> Optional[SynthesizedEvent]:
+    ) -> Optional[StopEvent]:
         """
-        3개 검색 에이전트의 결과를 합성해 최종 판정 초안을 생성한다.
+        3개 검색 에이전트의 결과를 합성해 근거 기반 답변을 생성하고 StopEvent로 종료한다.
 
         collect_events() 동작:
           세 이벤트 중 하나가 도착할 때마다 이 Step이 호출됨.
@@ -473,6 +476,8 @@ class ComplianceWorkflow(Workflow):
         # LlamaIndex는 타입 선언 순서대로 반환을 보장함
         reg_ev, law_ev, case_ev = collected
 
+        agents_used = await ctx.store.get("agents_used", [])
+
         prompt = load_prompt("synthesize_agent")
 
         # ── Phase 1 (코드): 검증된 근거 목록을 evidence_id 기준으로 색인 ────
@@ -488,6 +493,24 @@ class ComplianceWorkflow(Workflow):
             if item.get("evidence_id")
         }
 
+        # ── 근거 0건: LLM 호출 없이 답변 보류 ─────────────────────────────────
+        # 검증된 근거가 하나도 없으면 합성할 원문이 없다. LLM을 호출해도 ungrounded
+        # 답변만 나오므로 호출 자체를 생략하고 고정 메시지로 종료한다.
+        # (retrieved_ids=[] 가 main.py 재시도 트리거 신호가 된다.)
+        if not all_evidence:
+            logger.info("[synthesize] 검증된 근거 0건 → LLM 호출 생략, 답변 보류")
+            get_client().update_current_span(
+                output={"reasoning": "no_evidence", "cited_count": 0},
+                metadata={"agents_used": str(agents_used)},
+            )
+            return StopEvent(result=FinalAnswer(
+                query=reg_ev.query,
+                reasoning="검색된 근거가 없어 답변할 수 없습니다.",
+                cited_ids=[],
+                retrieved_ids=[],
+                agents_used=agents_used,
+            ))
+
         # Langfuse: Step 입력 기록 (LLM 호출 전)
         get_client().update_current_span(
             input={
@@ -496,200 +519,54 @@ class ComplianceWorkflow(Workflow):
             },
         )
 
-        # ── Phase 2 (LLM): 판정·근거 + cited_evidence_ids 선택 ──
+        # ── Phase 2 (LLM): 근거 기반 답변 + cited_evidence_ids 선택 ──
         context_str = format_synthesis_input(reg_ev, law_ev, case_ev)
         user_msg = (
             f"질문: {reg_ev.query}\n\n"
             f"수집된 검색 결과:\n{context_str}\n\n"
-            f"종합 판정을 JSON 형식으로 출력하세요."
+            f"질문에 대한 답변을 JSON 형식으로 출력하세요."
         )
 
         # 구조화 출력: SynthesisResponse 스키마를 Ollama format= 으로 강제하고
         # 응답을 Pydantic으로 검증해 객체로 받는다. 스키마를 벗어나면
-        # ValidationError → "판정 불가" 폴백.
+        # ValidationError → 답변 보류 폴백.
         try:
             parsed = await self._structured_predict_with_repair(
                 SynthesisResponse,
                 f"{prompt}\n\n{user_msg}",
             )
         except ValidationError as e:
-            logger.warning(f"[synthesize] 구조화 출력 검증 실패 → 판정 불가 폴백: {e}")
-            return SynthesizedEvent(
+            logger.warning(f"[synthesize] 구조화 출력 검증 실패 → 답변 보류 폴백: {e}")
+            return StopEvent(result=FinalAnswer(
                 query=reg_ev.query,
-                verdict="판정 불가",
-                reasoning="LLM 출력이 스키마를 위반하여 판정 보류",
-                cited_articles=[],
-            )
+                reasoning="LLM 출력이 스키마를 위반하여 답변 보류",
+                cited_ids=[],
+                retrieved_ids=list(all_evidence.keys()),
+                agents_used=agents_used,
+            ))
 
-        # ── Phase 1 (코드): cited_evidence_ids → cited_articles 재구성 ────
+        # ── Phase 1 (코드): cited_evidence_ids → 검증된 cited_ids 확정 ────
         # LLM이 선택한 evidence_id가 실제 all_evidence에 없으면 무시한다.
         # → LLM이 evidence_id를 잘못 기재해도 hallucination이 결과에 반영되지 않는다.
-        cited_articles = [
-            CitedArticle(
-                source_name=all_evidence[eid]["source_name"],
-                citation_id=all_evidence[eid]["citation_id"],
-            )
-            for eid in parsed.cited_evidence_ids
-            if eid in all_evidence
-        ]
+        cited_ids = [eid for eid in parsed.cited_evidence_ids if eid in all_evidence]
+        retrieved_ids = list(all_evidence.keys())
 
         # Langfuse: Step 출력 기록 (LLM 응답 후)
         get_client().update_current_span(
             output={
-                "verdict": parsed.verdict,
                 "reasoning": parsed.reasoning[:300],
-                "cited_count": len(cited_articles),
-                "cited_evidence_ids": parsed.cited_evidence_ids,
+                "cited_count": len(cited_ids),
+                "cited_ids": cited_ids,
+                "retrieved_ids": retrieved_ids,
             },
-        )
-
-        # verdict는 스키마로 보장되므로 정규화가 불필요하다.
-        return SynthesizedEvent(
-            query=reg_ev.query,
-            verdict=parsed.verdict,
-            reasoning=parsed.reasoning,
-            cited_articles=cited_articles,   # 코드가 재구성한 검증된 목록
-        )
-
-    # =========================================================================
-    # Step 4: factcheck_step
-    # -------------------------------------------------------------------------
-    # 입력: SynthesizedEvent
-    # 출력: StopEvent(result=FinalAnswer) 또는 SynthesizedEvent (재시도)
-    # Phase 1: article_lookup으로 인용 조항 원문 조회 (Rule-based)
-    # Phase 2: LLM이 인용 조항 존재 여부 판정
-    # 재시도: 검증 실패 시 SynthesizedEvent 재emit → synthesize_step 재실행
-    # =========================================================================
-
-    @step
-    @observe(name="factcheck_step", as_type="span", capture_input=False, capture_output=False)
-    async def factcheck_step(
-        self,
-        ctx: Context,
-        ev: SynthesizedEvent
-    ) -> StopEvent | SynthesizedEvent:
-        """
-        합성된 초안의 인용 조항이 실제로 존재하는지 검증한다.
-
-        반환 타입이 StopEvent | SynthesizedEvent인 이유:
-          - 검증 통과: StopEvent → 워크플로우 종료
-          - 검증 실패: SynthesizedEvent → synthesize_step 재실행 (최대 1회)
-          LlamaIndex가 이 유니온 반환 타입을 자동으로 처리한다.
-
-        재시도 루프 방지:
-          ctx.store("retry_count")가 MAX_FACTCHECK_RETRY(=1) 이상이면
-          더 이상 SynthesizedEvent를 재emit하지 않고 partial 결과로 종료한다.
-        """
-        # ── Phase 1: article_lookup으로 조항 존재 여부 확인 ────────────────
-        # LLM이 "표준투자권유준칙 제5조"를 인용했다고 해서
-        # 실제로 존재하는 조항인지는 보장할 수 없음 (hallucination 가능)
-        # article_lookup의 exact match로 존재 여부를 확인
-
-        # Langfuse: Step 입력 기록
-        get_client().update_current_span(
-            input={
-                "cited_articles": [c.model_dump() for c in ev.cited_articles],
-                "verdict_draft": ev.verdict,
-            },
-        )
-
-        lookup_results = []
-        for cited in ev.cited_articles:
-            # 각 인용 조항에 대해 article_lookup 호출
-            result = self.registry.article_lookup(
-                source_name=cited.source_name,
-                citation_id=cited.citation_id,
-            )
-            lookup_results.append({
-                "cited":  cited,
-                "found":  result,
-                "exists": result is not None,
-            })
-
-        if not lookup_results:
-            agents_used = await ctx.store.get("agents_used", [])
-            return StopEvent(result=FinalAnswer(
-                query=ev.query,
-                verdict=ev.verdict,
-                reasoning=ev.reasoning + " [검증 가능한 인용 없음]",
-                cited_articles=[],
-                factcheck_passed=False,
-                agents_used=agents_used,
-            ))
-
-        deterministic_failed = [
-            f"{item['cited'].source_name}||{item['cited'].citation_id}"
-            for item in lookup_results
-            if not item["exists"]
-        ]
-
-        # ── Phase 2: LLM 존재 여부 판정 ───────────────────────────────────────
-        prompt = load_prompt("factcheck_agent")
-
-        # LLM에게 인용 조항 목록과 조회 결과(존재 여부)를 제공
-        # 구조화 출력: 존재하지 않는 citation_id 목록을 받는다.
-        # 스키마 위반 시 LLM 실패목록은 무시하고 결정론적 검증만 적용한다.
-        context_str = format_factcheck_input(ev.verdict, ev.reasoning, lookup_results)
-        try:
-            parsed = await self._structured_predict_with_repair(
-                FactcheckResponse,
-                f"{prompt}\n\n{context_str}",
-            )
-            llm_failed = parsed.failed_items
-        except ValidationError as e:
-            logger.warning(f"[factcheck] 구조화 출력 검증 실패 → LLM 실패목록 무시: {e}")
-            llm_failed = []
-
-        failed_items = sorted(set(llm_failed + deterministic_failed))
-
-        if not failed_items:
-            # ── 검증 통과: 워크플로우 종료 ────────────────────────────
-            agents_used = await ctx.store.get("agents_used", [])
-            get_client().update_current_span(
-                output={"factcheck_passed": True, "failed_items": []},
-                metadata={"agents_used": str(agents_used)},
-            )
-            return StopEvent(result=FinalAnswer(
-                query=ev.query,
-                verdict=ev.verdict,
-                reasoning=ev.reasoning,
-                cited_articles=ev.cited_articles,
-                factcheck_passed=True,
-                agents_used=agents_used,
-            ))
-
-        # ── 검증 실패: 실패 조항만 제거하고 factcheck_step 재실행 ────
-        # SynthesizedEvent를 다시 emit하면 LlamaIndex가 synthesize_step이
-        # 아니라 factcheck_step(SynthesizedEvent를 받는 유일한 step)을
-        # 다시 트리거한다. 즉 합성은 한 번만, 검증만 재시도하는 구조.
-        retry_count: int = await ctx.store.get("retry_count", default=0)
-        if retry_count < MAX_FACTCHECK_RETRY:
-            await ctx.store.set("retry_count", retry_count + 1)
-            logger.warning(f"[factcheck] 검증 실패, 재시도: 실패 항목={failed_items}")
-            return SynthesizedEvent(
-                query=ev.query,
-                verdict=ev.verdict,
-                reasoning=ev.reasoning + f" [재시도: {failed_items} 조항 불일치]",
-                cited_articles=[
-                    c for c in ev.cited_articles
-                    if f"{c.source_name}||{c.citation_id}" not in failed_items
-                ],
-            )
-
-        # 재시도 한도 초과: partial 결과로 강제 종료
-        logger.warning("[factcheck] 재시도 한도 초과 → 강제 종료")
-        agents_used = await ctx.store.get("agents_used", [])
-        get_client().update_current_span(
-            output={"factcheck_passed": False, "failed_items": failed_items, "reason": "retry_exceeded"},
             metadata={"agents_used": str(agents_used)},
-            level="WARNING",
         )
+
         return StopEvent(result=FinalAnswer(
-            query=ev.query,
-            verdict=ev.verdict,
-            reasoning=ev.reasoning + " [일부 조항 검증 실패]",
-            cited_articles=ev.cited_articles,
-            factcheck_passed=False,
+            query=reg_ev.query,
+            reasoning=parsed.reasoning,
+            cited_ids=cited_ids,             # LLM이 사용한 검증 통과 ID
+            retrieved_ids=retrieved_ids,     # 검색된 전체 ID
             agents_used=agents_used,
         ))
 

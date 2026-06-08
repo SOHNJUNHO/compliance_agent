@@ -70,7 +70,7 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 
 ## Step 4 — Ingest data
 
-This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. Also writes `data/article_lookup.json` for exact-match factchecking.
+This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. Also writes `data/article_lookup.json` for exact-match validation.
 
 ```bash
 python run_ingest.py
@@ -100,10 +100,8 @@ python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요
 
 Expected output shape:
 ```
-[판정] 조건부 가능
-[근거] 표준투자권유준칙 제14조에 따라 고령투자자에게는 별도의 적합성 확인 절차가 필요합니다...
+[답변] 조건부 가능합니다. 표준투자권유준칙 제14조에 따라 고령투자자에게는 별도의 적합성 확인 절차가 필요합니다...
 [인용 조항] [{"source_name": "표준투자권유준칙", "citation_id": "제14조"}, ...]
-[팩트체크] 통과 ✓
 [실행 에이전트] ['규정', '법규']
 ```
 
@@ -135,7 +133,7 @@ python main.py query "준법감시인의 선임 요건과 직무 범위는 무�
 After a `query` run, open [cloud.langfuse.com](https://cloud.langfuse.com):
 
 - **Traces tab**: one root trace `compliance_query` per run
-  - Nested spans: `classify_step` → `search_규정` / `search_법규` / `search_사례` → `synthesize_step` → `factcheck_step`
+  - Nested spans: `classify_step` → `search_규정` / `search_법규` / `search_사례` → `synthesize_step`
   - Each span has structured `input` and `output` fields
 - **Prompts tab**: prompts are fetched lazily at query time with a local-file fallback — no auto-upload on run
   - **First-time setup**: seed all prompts once with `python manage_prompts.py`

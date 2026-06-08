@@ -31,8 +31,8 @@ logging.basicConfig(
 from langfuse import observe, get_client, propagate_attributes
 # Auto-instrumentation disabled to keep Langfuse traces to the 6 business steps.
 # Re-enable (uncomment) if you want raw LLM prompt/completion + token spans back.
-# from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-# LlamaIndexInstrumentor().instrument()
+from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+LlamaIndexInstrumentor().instrument()
 
 # =============================================================================
 # LLM 설정 (교체 지점)
@@ -104,19 +104,20 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
         handler = wf.run(query=query)
         result = await handler
 
-        if hasattr(result, "verdict"):
-            print(f"\n[판정] {result.verdict}")
-            print(f"[근거] {result.reasoning}")
-            print(f"[인용 조항] {result.cited_articles}")
-            print(f"[팩트체크] {'통과 ✓' if result.factcheck_passed else '실패 ✗'}")
+        # 검증된 근거 0건이면 최광역(전체 레인 + precision filter 해제)으로 1회만 재시도
+        if hasattr(result, "retrieved_ids") and not result.retrieved_ids:
+            logging.info("검증된 근거 0건 → 최광역 재시도 1회 (broaden=True)")
+            handler = wf.run(query=query, broaden=True)
+            result = await handler
+
+        if hasattr(result, "reasoning"):
+            print(f"\n[답변] {result.reasoning}")
+            print(f"[사용된 근거 ID] {result.cited_ids}")
+            print(f"[검색된 근거 ID] {result.retrieved_ids}")
             print(f"[실행 에이전트] {result.agents_used}")
 
             # Langfuse 루트 트레이스 출력 기록
             client.update_current_span(
-                output={
-                    "verdict": result.verdict,
-                    "factcheck_passed": result.factcheck_passed,
-                },
                 metadata={
                     "agents_used": str(result.agents_used),
                 },
