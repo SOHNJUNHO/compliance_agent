@@ -254,7 +254,6 @@ class ComplianceWorkflow(Workflow):
         get_client().update_current_span(input={"query": query})
 
         # ctx 초기값 설정 (이후 Step들이 읽고 업데이트함)
-        await ctx.store.set("agents_used", [])   # 실제 실행된 에이전트 기록
 
         # ── LLM 라우팅 (구조화 출력) ──────────────────────────────────────────
         # ClassifyResponse 스키마를 Ollama format= 으로 강제 → agents가 허용 3종으로
@@ -371,15 +370,13 @@ class ComplianceWorkflow(Workflow):
             )
             return self._skip_event(lane, ev.query)
 
-        # ── 검증 + agents_used 기록 ────────────────────────────────────────
+        # ── 검증 ──────────────────────────────────────────────────────────
         if lane.is_case:
             evidence = validate_case_evidence(raw_results)
         else:
             evidence = validate_article_evidence(
                 raw_results, self.registry.article_lookup
             )
-        agents_used = await ctx.store.get("agents_used", [])
-        await ctx.store.set("agents_used", agents_used + [lane.name])
 
         # ── 결과 이벤트 구성 ───────────────────────────────────────────────
         # case_nos / articles 라벨은 Langfuse 관찰용으로만 남기고, 이벤트에는
@@ -446,7 +443,13 @@ class ComplianceWorkflow(Workflow):
         # LlamaIndex는 타입 선언 순서대로 반환을 보장함
         reg_ev, law_ev, case_ev = collected
 
-        agents_used = await ctx.store.get("agents_used", [])
+        # agents_used: 수집된 이벤트에서 직접 파생한다. 각 레인은 skip/실패 시
+        # skipped=True로 표시하므로 not skipped == 실제 실행 및 완료된 레인과 동치.
+        # ctx.store 누적 방식의 read-modify-write 경쟁 조건을 제거하고 결정적 순서를 보장.
+        agents_used = [
+            name for name, lane_ev in (("규정", reg_ev), ("법규", law_ev), ("사례", case_ev))
+            if not lane_ev.skipped
+        ]
         routing_reasoning = await ctx.store.get("routing_reasoning", "")
 
         # ── Phase 1 (코드): 3개 레인 근거를 단일 리스트로 합산 ─────────────────
@@ -513,6 +516,7 @@ class ComplianceWorkflow(Workflow):
         # ── Phase 3 (코드 reduce): 관련 있는 근거만 인용 블록으로 조합 ──────────
         cited_ids: list[str] = []
         cited_passages: list[dict] = []  # [인용 근거] 출력용: evidence_id + text
+        cited_source_types: set[str] = set()  # 인용된 근거의 source_type → cited_agents 도출용
         blocks: list[str] = []
 
         for item, pa in results:
@@ -523,7 +527,15 @@ class ComplianceWorkflow(Workflow):
                 continue  # 검증된 근거엔 항상 evidence_id가 있으나, 없으면 인용 바인딩 불가
             cited_ids.append(eid)
             cited_passages.append({"evidence_id": eid, "text": item.get("text", "")})
+            cited_source_types.add(item.get("source_type", ""))
             blocks.append(format_cited_block(item, pa.answer))
+
+        # cited_agents: 실제 인용된 source_type을 에이전트명으로 매핑, 규정→법규→사례 순 고정
+        cited_agents = [
+            agent
+            for stype, agent in (("사규", "규정"), ("법규", "법규"), ("분쟁사례", "사례"))
+            if stype in cited_source_types
+        ]
 
         if not blocks:
             # 근거는 검색됐으나 관련 passage가 없는 경우.
@@ -539,6 +551,7 @@ class ComplianceWorkflow(Workflow):
                 "cited_count": len(cited_ids),
                 "relevant_count": len(blocks),
                 "cited_ids": cited_ids,
+                "cited_agents": cited_agents,
                 "retrieved_ids": retrieved_ids,
             },
             metadata={"agents_used": str(agents_used)},
@@ -549,6 +562,7 @@ class ComplianceWorkflow(Workflow):
             cited_ids=cited_ids,          # 코드가 부착한 인용 ID (hallucination 불가)
             cited_passages=cited_passages,  # [인용 근거] 출력용 (evidence_id + text)
             agents_used=agents_used,
+            cited_agents=cited_agents,    # agents_used의 부분집합: 실제 인용된 에이전트
             routing_reasoning=routing_reasoning,
         ))
 

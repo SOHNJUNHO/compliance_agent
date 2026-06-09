@@ -111,6 +111,7 @@ class FinalAnswer(Event):
 
     # 포트폴리오 설명용 메타 정보
     agents_used:       list[str]   # 실제 실행된 에이전트 목록 (예: ["규정", "법규"])
+    cited_agents:      list[str] = []   # 답변에 근거가 실제 인용된 에이전트 (agents_used의 부분집합)
     routing_reasoning: str = ""    # classify_step이 그 에이전트들을 선택한 이유
 
 

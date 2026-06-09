@@ -65,7 +65,6 @@ def _make_search_fn(
           "article_no":  "제5조",
           "case_no":     "",
           "url":         "https://...",
-          "score":       0.87          ← 코사인 유사도 점수 (재순위 후에도 원본 유지)
         },
         ...
       ]
@@ -118,8 +117,6 @@ def _make_search_fn(
                 "article_no":  node.metadata.get("article_no", ""),
                 "section_no": node.metadata.get("section_no", ""),
                 "case_no":     node.metadata.get("case_no", ""),
-                # score: 코사인 유사도 (1.0에 가까울수록 관련성 높음)
-                "score":       round(node.score or 0.0, 4),
             })
         return results
 

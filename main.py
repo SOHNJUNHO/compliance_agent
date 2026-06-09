@@ -109,6 +109,7 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
             print(f"\n[답변]\n{result.reasoning}")
             print(f"[사용된 근거 ID] {result.cited_ids}")
             print(f"[실행 에이전트] {result.agents_used}")
+            print(f"[인용 에이전트] {result.cited_agents}")
             print(f"[활성화 근거] {result.routing_reasoning}")
 
             if result.cited_passages:
@@ -118,6 +119,10 @@ async def run_query(query: str, user_id: str = "anonymous") -> None:
 
             # Langfuse 루트 트레이스 출력 기록
             client.update_current_span(
+                output={
+                    "answer": result.reasoning,
+                    "cited_ids": result.cited_ids,
+                },
                 metadata={
                     "agents_used": str(result.agents_used),
                 },

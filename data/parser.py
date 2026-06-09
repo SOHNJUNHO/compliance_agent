@@ -81,8 +81,6 @@ class ParsedChunk:
     # "인용 제목\n본문" 형태로 구성
     text:        str
 
-    verified:     bool = False
-
 
 def _make_doc_id(source_type: str, source_name: str, identifier: str) -> str:
     """
@@ -127,7 +125,6 @@ def _make_parsed_chunk(
         case_no=case_no,
         url=url,
         text=cleaned,
-        verified=False,
     )
 
 
@@ -144,18 +141,18 @@ SECTION_HEADING_PATTERN = re.compile(r"^(\d+(?:\.\d+)+)\s+(.{2,40})$")
 def _normalize_article_heading(heading: str) -> tuple[Optional[str], Optional[str], str]:
     """
     제목 문자열에서 조항번호·제목·표시명을 추출한다.
-    반환: (article_no, article_title, display)
-      예: "제 5 조(목적)" → ("제5조", "목적", "제5조(목적)")
+    반환: (article_no, display)
+      예: "제 5 조(목적)" → ("제5조", "제5조(목적)")
     """
     cleaned = re.sub(r"\s+", " ", heading).strip()
     match = ARTICLE_HEADING_PATTERN.match(cleaned)
     if not match:
-        return None, None, cleaned
+        return None, cleaned
     # 조항번호 내부 공백 제거: "제 5 조" → "제5조"
     article_no = re.sub(r"\s+", "", match.group(1))
     article_title = (match.group(2) or "").strip() or None
     display = f"{article_no}({article_title})" if article_title else article_no
-    return article_no, article_title, display
+    return article_no, display
 
 
 def _sections_from_jo_divs(soup: BeautifulSoup) -> list[tuple[str, str]]:
@@ -253,7 +250,7 @@ def _parse_kofia_article_html(doc: RawDocument, soup: BeautifulSoup) -> list[Par
     chunks = []
     for heading, body in _sections_from_jo_divs(soup):
         heading_clean = re.sub(r"\s+", " ", heading).strip()
-        article_no, article_title, display = _normalize_article_heading(heading_clean)
+        article_no, display = _normalize_article_heading(heading_clean)
         if not article_no:
             continue  # 조항 패턴 불일치 → 섹션형 문서의 제목 등 → 스킵
 

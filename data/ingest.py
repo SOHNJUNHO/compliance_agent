@@ -94,12 +94,11 @@ def chunk_to_node(chunk: ParsedChunk) -> TextNode:
             "section_no": chunk.section_no or "",
             "case_no":     chunk.case_no or "",     # "2022-증권-031"
             "url":         chunk.url,               # 출처 추적용 (워크플로우 미사용)
-            "verified":     chunk.verified,
         },
 
         # 임베딩 시 텍스트에 포함하지 않을 메타데이터 키
         excluded_embed_metadata_keys=[
-            "url", "citation_id", "article_no", "case_no", "verified",
+            "url", "citation_id", "article_no", "case_no",
         ],
 
         # LLM 컨텍스트에 전달하지 않을 메타데이터 키
