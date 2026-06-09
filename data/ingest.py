@@ -12,10 +12,11 @@
 # 별도 파일로 저장하지 않고 query 시 load_lookup_table()이 Qdrant 페이로드에서 직접 구성한다 — 중복 저장 제거.
 #
 # 교체 지점:
-#   EMBEDDING_MODEL: Ollama 임베딩 모델 (기본 qwen3-embedding:0.6b)
-#   QDRANT_URL:      Qdrant 서버 주소 (기본 http://localhost:6333)
+#   EMBED_API_BASE:    임베딩 서버 (vLLM/TEI) 주소. 미설정 시 Ollama 사용.
+#   EMBED_MODEL:       임베딩 모델명 (기본 qwen3-embedding:0.6b)
+#   QDRANT_URL:        Qdrant 서버 주소 (기본 http://localhost:6333)
 #   QDRANT_COLLECTION: Qdrant 컬렉션명 (기본 compliance_agent)
-#   USE_QDRANT:      Qdrant 사용 여부 (0이면 인메모리 VectorStore 사용)
+#   USE_QDRANT:        Qdrant 사용 여부 (0이면 인메모리 VectorStore 사용)
 # =============================================================================
 
 import os
@@ -29,18 +30,38 @@ from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.schema import TextNode
 # TextNode is a single chunk of text plus metadata.
 
-# OllamaEmbedding: Ollama에서 실행 중인 Qwen embedding 모델을 사용
-from llama_index.embeddings.ollama import OllamaEmbedding
-
 from .parser import ParsedChunk
 
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# 교체 지점
+# 임베딩 모델 설정 (교체 지점)
 # =============================================================================
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
-EMBEDDING_MODEL = OllamaEmbedding(model_name=EMBEDDING_MODEL_NAME)
+# 두 가지 모드:
+#   프로덕션 (EMBED_API_BASE 설정됨):
+#     vLLM 또는 TEI 서버의 OpenAI-compatible 임베딩 엔드포인트를 사용한다.
+#     EMBED_API_BASE=http://<vllm-host>:8001/v1
+#     EMBED_MODEL=qwen3-embedding-0.6B (또는 서버 served-model-name)
+#     EMBED_API_KEY=EMPTY
+#
+#   로컬 개발 (EMBED_API_BASE 미설정):
+#     Ollama 로컬 서버를 사용한다 (ollama pull qwen3-embedding:0.6b-q8_0).
+_EMBED_API_BASE = os.getenv("EMBED_API_BASE", "")
+_EMBED_MODEL    = os.getenv("EMBED_MODEL",    os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b"))
+_EMBED_API_KEY  = os.getenv("EMBED_API_KEY",  "EMPTY")
+
+if _EMBED_API_BASE:
+    # 프로덕션: vLLM / TEI (OpenAI-compatible embedding API)
+    from llama_index.embeddings.openai_like import OpenAILikeEmbedding
+    EMBEDDING_MODEL = OpenAILikeEmbedding(
+        model_name=_EMBED_MODEL,
+        api_base=_EMBED_API_BASE,
+        api_key=_EMBED_API_KEY,
+    )
+else:
+    # 로컬 개발: Ollama
+    from llama_index.embeddings.ollama import OllamaEmbedding
+    EMBEDDING_MODEL = OllamaEmbedding(model_name=_EMBED_MODEL)
 
 QDRANT_URL        = os.getenv("QDRANT_URL",        "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "compliance_agent")

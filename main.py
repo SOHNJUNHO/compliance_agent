@@ -38,18 +38,42 @@ LlamaIndexInstrumentor().instrument()
 # =============================================================================
 # LLM 설정 (교체 지점)
 # =============================================================================
-# 옵션 설명:
-#   model:           Ollama에 설치된 모델명 (ollama pull qwen3:8b-q4_K_M 필요)
-#   request_timeout: 단일 요청 최대 대기 시간 (초)
-#   json_mode:       True → Ollama가 항상 유효한 JSON을 반환하도록 강제
-from llama_index.llms.ollama import Ollama
+# 두 가지 모드를 환경변수로 선택한다:
+#
+#   프로덕션 (LLM_API_BASE 설정됨):
+#     vLLM OpenAI-compatible 서버 (GPU EC2)를 사용한다.
+#     LLM_API_BASE=http://<vllm-host>:8000/v1
+#     LLM_MODEL=Qwen3-8B (또는 vLLM --served-model-name 값)
+#     LLM_API_KEY=EMPTY (vLLM 기본값; 인증 설정 시 실제 키)
+#
+#   로컬 개발 (LLM_API_BASE 미설정):
+#     Ollama 로컬 서버를 사용한다 (ollama serve + ollama pull qwen3:8b-q4_K_M).
+import os as _os
 
-LLM_INSTANCE = Ollama(
-    model="qwen3:8b-q4_K_M",
-    request_timeout=120.0,
-    json_mode=True,    # 출력을 유효한 JSON으로 강제
-    thinking=False,    # qwen3 추론(<think>) 출력 비활성화 → 응답이 순수 JSON이 됨
-)
+_LLM_API_BASE = _os.getenv("LLM_API_BASE", "")
+_LLM_MODEL    = _os.getenv("LLM_MODEL",    "qwen3:8b-q4_K_M")
+_LLM_API_KEY  = _os.getenv("LLM_API_KEY",  "EMPTY")
+
+if _LLM_API_BASE:
+    # 프로덕션: vLLM (OpenAI-compatible API)
+    from llama_index.llms.openai_like import OpenAILike
+    LLM_INSTANCE = OpenAILike(
+        model=_LLM_MODEL,
+        api_base=_LLM_API_BASE,
+        api_key=_LLM_API_KEY,
+        is_chat_model=True,
+        is_function_calling_model=True,  # astructured_predict → tool-calling 경로
+        request_timeout=120.0,
+    )
+else:
+    # 로컬 개발: Ollama
+    from llama_index.llms.ollama import Ollama
+    LLM_INSTANCE = Ollama(
+        model=_LLM_MODEL,
+        request_timeout=120.0,
+        json_mode=True,    # 출력을 유효한 JSON으로 강제
+        thinking=False,    # qwen3 추론(<think>) 출력 비활성화 → 응답이 순수 JSON이 됨
+    )
 
 
 # =============================================================================

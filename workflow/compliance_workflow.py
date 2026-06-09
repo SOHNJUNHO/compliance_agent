@@ -8,7 +8,7 @@
 #   - Workflow 클래스를 상속하고 @step 데코레이터로 Step을 정의한다.
 #   - 각 Step의 입력/출력 타입 어노테이션으로 LlamaIndex가 DAG를 자동 구성한다.
 #   - async/await 기반이므로 Step 2a/b/c는 실제로 동시에 실행된다.
-#     (단, Ollama는 직렬 처리이므로 실질적 병렬 실행은 아님 — README 참조)
+#     (vLLM 서버는 병렬 요청을 지원하므로 실질적 병렬 실행이 가능하다)
 #
 # Step 구성:
 #   Step 1: classify_step   — LLM 기반 라우팅 (constrained JSON output)
@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import httpx
-import ollama
+import openai
 
 from pydantic import ValidationError
 
@@ -140,7 +140,7 @@ class ComplianceWorkflow(Workflow):
     증권사 컴플라이언스 Q&A 멀티에이전트 워크플로우.
 
     초기화:
-      llm:      LLM 인스턴스 (main.py에서 Ollama로 설정)
+      llm:      LLM 인스턴스 (main.py 또는 app/server.py에서 주입 — Ollama 또는 OpenAILike)
       registry: ToolRegistry (검색/조회 함수 보유)
       timeout:  LlamaIndex 내장 전체 타임아웃 (초)
                 → 이 시간 초과 시 워크플로우 강제 종료
@@ -176,7 +176,7 @@ class ComplianceWorkflow(Workflow):
           오류 메시지를 프롬프트에 되먹여 최대 max_repair회 재요청.
           한도 초과 시 ValidationError를 그대로 올려 호출부의 폴백 정책을 유지한다.
 
-        httpx / ollama 전송 오류 (네트워크·타임아웃):
+        httpx / openai 전송 오류 (네트워크·타임아웃):
           지수 백오프(0.5s → 1s)로 최대 max_transport_retry회 재시도.
           한도 초과 시 예외를 그대로 올려 fail-loud 정책을 유지한다.
         """
@@ -202,14 +202,15 @@ class ComplianceWorkflow(Workflow):
             except (
                 httpx.TimeoutException,
                 httpx.ConnectError,
-                ollama.ResponseError,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
             ) as e:
                 if transport >= max_transport_retry:
                     raise
                 transport += 1
                 wait = 0.5 * 2 ** (transport - 1)
                 logger.warning(
-                    f"[transport] Ollama 통신 실패 → {wait}s 후 재시도 "
+                    f"[transport] LLM 통신 실패 → {wait}s 후 재시도 "
                     f"{transport}/{max_transport_retry}: {e}"
                 )
                 await asyncio.sleep(wait)
@@ -509,8 +510,8 @@ class ComplianceWorkflow(Workflow):
                 )
                 return item, None
 
-        # asyncio.gather: 근거가 적으면 overlap이 없지만 코드 구조는 동일
-        # OLLAMA_NUM_PARALLEL 설정 시 실제 병렬 실행 가능
+        # asyncio.gather: 근거를 병렬로 평가한다.
+        # vLLM 서버는 병렬 요청을 지원하므로 다중 근거 처리 시 실질적 성능 향상이 있다.
         results = await asyncio.gather(*[_answer_passage(item) for item in evidence_list])
 
         # ── Phase 3 (코드 reduce): 관련 있는 근거만 인용 블록으로 조합 ──────────
@@ -597,7 +598,8 @@ class ComplianceWorkflow(Workflow):
         try:
             prompt = load_prompt(prompt_name).replace("{query}", query)
             response = await self.llm.acomplete(prompt)
-            # json_mode=True wraps the response in JSON; extract the hypothesis text
+            # vLLM with guided JSON (or Ollama json_mode) returns a JSON object;
+            # extract the hypothesis text from it.
             parsed = json.loads(response.text)
             hypothesis = parsed.get("hypothesis", "").strip()
             if len(hypothesis) >= 20:
@@ -611,7 +613,7 @@ class ComplianceWorkflow(Workflow):
     # 검색 근거 추출·검증·포맷 로직은 evidence.py로 분리했다 (순수 함수).
 
     # ── LLM 응답 JSON 파서들 ────────────────────────────────────────────────
-    # json_mode=True + thinking=False로 LLM이 순수 JSON만 반환하도록 강제했으므로
+    # vLLM guided JSON (또는 Ollama json_mode)으로 LLM이 순수 JSON만 반환하도록 강제했으므로
     # 방어적 추출(_safe_json)은 더 이상 필요 없다. 직접 json.loads로 파싱한다.
     # (롤백 대비를 위해 _safe_json 구현은 삭제하지 않고 주석으로 보존한다.)
 
