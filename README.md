@@ -83,18 +83,29 @@ LlamaIndex와 LangChain은 Qdrant 페이로드 구조가 호환되지 않습니�
 
 페이로드 인덱스도 중첩 키 기준으로 생성됩니다: `metadata.source_type`, `metadata.source_name`, `metadata.citation_id`, `metadata.article_no`, `metadata.case_no`.
 
-### 적재 명령
+### 적재 순서 (self-hosted Docker Compose 기준)
+
+Qdrant가 HTTP API를 통해 데이터를 받으므로 컨테이너를 먼저 기동한 뒤 ingest를 실행합니다.
 
 ```bash
+# 1. Qdrant 기동 (최초 1회 — volume이 이미 있으면 기존 데이터 유지)
+docker compose up -d
+docker compose ps        # healthy 확인
+
+# 2. 데이터 적재 (최초 1회 또는 소스 데이터 변경 시)
 python data/run_ingest_lc.py               # 웹 데이터만 수집
 python data/run_ingest_lc.py ./fss.pdf     # PDF 추가 적재
 ```
+
+컬렉션 데이터는 `qdrant_storage` Docker named volume에 영속됩니다. 컨테이너를 재시작해도 re-ingest가 불필요합니다. 소스 데이터가 바뀔 때만 재실행하면 됩니다.
 
 컬렉션 이름은 `QDRANT_COLLECTION_LC` 환경변수로 오버라이드할 수 있습니다 (기본값 `compliance_agent_lc`).
 
 ---
 
 ## 실행
+
+### Self-hosted Qdrant (Docker Compose) — 권장
 
 ```bash
 # 1. Ollama 실행 (별도 터미널)
@@ -103,18 +114,27 @@ ollama pull qwen3:8b-q4_K_M              # LLM (~5.2 GB)
 ollama pull qwen3-embedding:0.6b-q8_0   # embedding (~0.6 GB)
 
 # 2. 환경변수
-cp .env.example .env                     # Qdrant Cloud / Langfuse 키 입력
+cp .env.example .env     # Option A 블록이 기본값 — 수정 불필요 (localhost:6333, 키 없음)
+                         # Langfuse 키는 선택 사항 (없으면 no-op fallback)
 
 # 3. 의존성
 uv sync
 
-# 4. 1회 ingest (compliance_agent_lc 컬렉션 생성)
+# 4. Qdrant 기동 (Docker 필요, 최초 1회)
+docker compose up -d
+docker compose ps        # healthy 확인
+
+# 5. 1회 ingest (compliance_agent_lc 컬렉션 생성 — 이후 컨테이너 재시작해도 불필요)
 python data/run_ingest_lc.py
 
-# 5. 반복 query
+# 6. 반복 query
 python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?"
 python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?" user-001
 ```
+
+### Qdrant Cloud 사용 시
+
+`.env`에서 Option B 블록으로 교체(`QDRANT_URL`, `QDRANT_API_KEY` 입력)하고 Step 4(Compose)를 건너뜁니다. 나머지 단계 동일.
 
 ### 하드웨어 / 실행 시간 (Apple M5 기준)
 

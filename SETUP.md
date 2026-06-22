@@ -3,6 +3,10 @@
 Multi-agent compliance Q&A system for Korean securities firms.
 This guide covers everything needed to run the project from scratch.
 
+> **This branch (`feature/langgraph-port`)** uses LangGraph + LangChain and a separate
+> Qdrant collection (`compliance_agent_lc`). A `docker-compose.yml` is provided for
+> self-hosted single-node Qdrant. Qdrant Cloud works too — see Step 3.
+
 ---
 
 ## Prerequisites
@@ -12,8 +16,8 @@ This guide covers everything needed to run the project from scratch.
 | **Python 3.11+** | Required by `pyproject.toml` |
 | **uv** | Package manager — install from [astral.sh/uv](https://astral.sh/uv) |
 | **Ollama** | Local LLM server — install from [ollama.com](https://ollama.com) |
-| **Qdrant Cloud account** | Free tier available at [cloud.qdrant.tech](https://cloud.qdrant.tech) |
-| **Langfuse account** | Free tier available at [cloud.langfuse.com](https://cloud.langfuse.com) |
+| **Docker** | For self-hosted Qdrant via `docker compose` (or use Qdrant Cloud) |
+| **Langfuse account** | Optional — free tier at [cloud.langfuse.com](https://cloud.langfuse.com) (workflow runs without it) |
 
 ---
 
@@ -46,34 +50,57 @@ ollama pull qwen3-embedding:0.6b-q8_0  # embedding model, 8-bit quantized (~0.6 
 
 ## Step 3 — Configure environment variables
 
-Copy the example file and fill in your keys:
+Copy the example file:
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and set:
+### Option A — Self-hosted Qdrant (Docker Compose, default)
+
+The `.env.example` Option A block is already set to `localhost:6333` with no API key.
+No edits needed for Qdrant. Optionally add Langfuse keys:
 
 ```
-# Qdrant Cloud — console.qdrant.tech → your cluster → API Keys
-QDRANT_URL=https://<cluster-id>.qdrant.tech
-QDRANT_API_KEY=<your-qdrant-api-key>
-
-# Langfuse — cloud.langfuse.com → Settings → API Keys
 LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 ```
 
-`QDRANT_COLLECTION` defaults to `compliance_agent`. `LANGFUSE_BASE_URL` defaults to `https://cloud.langfuse.com`. You only need to set these if you use a different collection name or a self-hosted Langfuse instance.
+### Option B — Qdrant Cloud
+
+Uncomment the Option B block in `.env` and fill in:
+
+```
+QDRANT_URL=https://<cluster-id>.qdrant.tech
+QDRANT_API_KEY=<your-qdrant-api-key>
+```
+
+`QDRANT_COLLECTION_LC` defaults to `compliance_agent_lc`. `LANGFUSE_BASE_URL` defaults
+to `https://cloud.langfuse.com`. Only set these to override.
 
 ---
 
-## Step 4 — Ingest data
+## Step 4 — Start Qdrant (self-hosted only)
 
-This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads them to Qdrant Cloud. The exact-match lookup table is built from Qdrant at query time — no separate file is written.
+Skip this step if using Qdrant Cloud.
 
 ```bash
-python run_ingest.py
+docker compose up -d
+docker compose ps     # wait for the 'healthy' status
+```
+
+Qdrant is now listening on `localhost:6333`. Data written during ingest is stored in the
+`qdrant_storage` Docker named volume — it survives container restarts.
+
+---
+
+## Step 5 — Ingest data
+
+This parses the raw HTML/XML files in `data/raw/`, embeds all 850 chunks, and uploads
+them to the `compliance_agent_lc` Qdrant collection.
+
+```bash
+python data/run_ingest_lc.py
 ```
 
 Expected output:
@@ -82,17 +109,21 @@ Expected output:
 INFO scraper: [raw] 로컬 RawDocument 8개 로드
 === 2. 파싱 ===
 INFO parser: 총 850개 청크 파싱 완료
-=== 3. 적재 ===
-INFO ingest: Qdrant 사용: https://...qdrant.tech / collection=compliance_agent
-INFO ingest: VectorStoreIndex 구성 완료
-완료: 850개 청크 적재됨
+파싱 완료: 850개 청크
+=== 3. 적재 (LangChain → compliance_agent_lc) ===
+INFO ingest_lc: [qdrant] 컬렉션 생성 완료 (TurboQuant BITS4): compliance_agent_lc
+INFO ingest_lc: [qdrant] 850개 문서 적재 완료: compliance_agent_lc
+적재 완료: 850개 청크
 ```
 
-Ingest takes **2–5 minutes** on first run (embedding 850 chunks via Ollama). Qdrant Cloud persists the collection so you only need to re-run ingest if the source data changes.
+Ingest takes **2–5 minutes** on first run (embedding 850 chunks via Ollama). The
+collection persists in the Docker volume (or Qdrant Cloud) so you only need to re-run
+ingest if the source data changes. Restarting the Docker container does **not** require
+re-ingest.
 
 ---
 
-## Step 5 — Run a query
+## Step 6 — Run a query
 
 ```bash
 python main.py query "65세 고객에게 레버리지 ETF 권유 가능한가요?"
@@ -113,7 +144,7 @@ Expected output shape:
 ```
 
 > **Note**: `query` mode loads the existing Qdrant collection — no re-embedding.
-> Run `python run_ingest.py` once (or whenever source data changes); subsequent `query` runs reuse the persisted collection.
+> Run `python data/run_ingest_lc.py` once (or whenever source data changes); subsequent `query` runs reuse the persisted collection.
 
 ---
 
@@ -139,13 +170,14 @@ python main.py query "준법감시인의 선임 요건과 직무 범위는 무�
 
 After a `query` run, open [cloud.langfuse.com](https://cloud.langfuse.com):
 
-- **Traces tab**: one root trace `compliance_query` per run
-  - Nested spans: `classify_step` → `search_규정` / `search_법규` / `search_사례` → `synthesize_step`
-  - Each span has structured `input` and `output` fields
+- **Traces tab**: one trace per run; nested nodes: `classify` → `search` ×N → `synthesize`,
+  plus automatic LLM call and retriever spans from the `CallbackHandler`.
 - **Prompts tab**: prompts are fetched lazily at query time with a local-file fallback — no auto-upload on run
   - **First-time setup**: seed all prompts once with `python manage_prompts.py`
-  - **After editing** a local `prompts/*.txt` file: run `python manage_prompts.py` to publish a new version to Langfuse
+  - **After editing** a local `prompts/*.txt` file: run `python manage_prompts.py` to publish a new version
   - **Bootstrap flag**: `LANGFUSE_SYNC_PROMPTS=1 python main.py query ...` also triggers a one-time create-if-missing sync
+
+Langfuse is optional — if keys are not set, the workflow still runs without any observability.
 
 ---
 
@@ -154,7 +186,7 @@ After a `query` run, open [cloud.langfuse.com](https://cloud.langfuse.com):
 The system supports optional PDF input from the Financial Supervisory Service:
 
 ```bash
-python run_ingest.py ./분쟁사례.pdf
+python data/run_ingest_lc.py ./분쟁사례.pdf
 ```
 
 ---
@@ -163,11 +195,13 @@ python run_ingest.py ./분쟁사례.pdf
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `Connection refused` on port 6333 | Qdrant container not running | `docker compose up -d` then `docker compose ps` |
+| Qdrant collection not found on startup | Ingest not run | Run `python data/run_ingest_lc.py` after `docker compose up -d` |
 | `Connection refused` on Ollama | Ollama not running | Run `ollama serve` in a separate terminal |
-| `Unauthorized` from Qdrant | Wrong API key | Check `QDRANT_API_KEY` in `.env` |
+| `Unauthorized` from Qdrant | API key set for a no-auth server | Leave `QDRANT_API_KEY=` empty in `.env` for self-hosted |
 | `Langfuse` warnings in logs | Langfuse not configured | Set `LANGFUSE_*` env vars in `.env`, or ignore (workflow still runs) |
 | `사용자 정보 검증에 실패하였습니다` | DRF API key invalid | Only matters for re-scraping; local `data/raw/` files are used by default |
-| Empty search results | Qdrant collection empty | Run `python run_ingest.py` first |
+| Empty search results | `metadata.source_type` filter mismatch | Confirm ingest used `run_ingest_lc.py` (not the LlamaIndex `run_ingest.py`) |
 | Slow first query | Reranker model load from HuggingFace (~2.2 GB, one-time) | Expected — cached after first run; set `USE_RERANKER=0` to skip |
 
 ---
@@ -178,8 +212,8 @@ python run_ingest.py ./분쟁사례.pdf
 |---|---|---|
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Ollama embedding model name |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant server URL |
-| `QDRANT_COLLECTION` | `compliance_agent` | Qdrant collection name |
-| `QDRANT_API_KEY` | *(empty)* | Qdrant Cloud API key (empty = local, no auth) |
+| `QDRANT_COLLECTION_LC` | `compliance_agent_lc` | Qdrant collection name (LangChain branch) |
+| `QDRANT_API_KEY` | *(empty)* | Qdrant API key (empty = no auth, correct for self-hosted) |
 | `QDRANT_VECTOR_DIM` | `1024` | Embedding output dimension — must match `EMBEDDING_MODEL` |
 | `USE_QDRANT` | `1` | Set to `0` to use in-memory store (no Qdrant required) |
 | `USE_RERANKER` | `1` | Set to `0` to skip cross-encoder reranking |
